@@ -95,11 +95,12 @@ from speech_text import FILLER, WAKE_RE, clean_text, split_text
 CHRONIK = chronik_mod.Chronik(CFG['name'])
 
 
-# ───────────────────────────── CPU-Boost ─────────────────────────────
+# ───────────────────────────── CPU/GPU-Boost ─────────────────────────────
 class Boost:
-    """Hebt den Mindesttakt an, solange Jarvis zuhört/denkt/spricht -> schnellere Reaktion (JSON-Parsing,
-    Sprachausgabe, Spracherkennung). Im Leerlauf zurück auf die Werkseinstellung -> kühl und akkuschonend.
-    Kein Übertakten: es werden nur vorhandene Taktstufen des Kernels genutzt."""
+    """Hebt CPU- und GPU-Mindesttakt an, solange Jarvis zuhört/denkt/spricht -> schnellere Reaktion
+    (JSON-Parsing, Sprachausgabe, Spracherkennung, HUD-Rendering). Im Leerlauf zurück auf die
+    Werkseinstellung -> kühl und akkuschonend. Kein Übertakten: es werden nur vorhandene
+    Taktstufen des Kernels genutzt."""
     POL = {'/sys/devices/system/cpu/cpufreq/policy0': 1248000,     # 4x A53
            '/sys/devices/system/cpu/cpufreq/policy4': 1248000,     # 2x A53
            '/sys/devices/system/cpu/cpufreq/policy6': 1560000}     # 2x A73 (große Kerne)
@@ -114,8 +115,10 @@ class Boost:
         self.enabled = CFG.get('cpu_boost', True) and bool(self.orig)
 
     def _write(self, on):
-        subprocess.Popen([os.path.join(JDIR, 'bin', 'jarvis-root'), 'cpumin', 'on' if on else 'off'],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        v = 'on' if on else 'off'
+        for sub in ('cpumin', 'gpumin'):
+            subprocess.Popen([os.path.join(JDIR, 'bin', 'jarvis-root'), sub, v],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def set(self, active):
         if not self.enabled:
@@ -133,8 +136,9 @@ class Boost:
     def restore(self):
         if self.timer: self.timer.cancel()
         if self.orig:
-            subprocess.run([os.path.join(JDIR, 'bin', 'jarvis-root'), 'cpumin', 'off'],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            for sub in ('cpumin', 'gpumin'):
+                subprocess.run([os.path.join(JDIR, 'bin', 'jarvis-root'), sub, 'off'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
 
 BOOST = None
 

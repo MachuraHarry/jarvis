@@ -25,6 +25,15 @@ case "$cmd" in
       esac
       echo "$f" > "$p/scaling_min_freq" 2>/dev/null || true
     done ;;
+  gpumin)                              # gpumin on|off  (GPU-Mindesttakt anheben / Werkseinstellung)
+    d=/sys/class/devfreq/11500000.gpu
+    [ -d "$d" ] || die "GPU-devfreq nicht gefunden"
+    case "${1:-}" in
+      on) f=545000000 ;;
+      off) f=$(cut -d' ' -f1 "$d/available_frequencies") ;;
+      *) die "on|off erwartet" ;;
+    esac
+    echo "$f" > "$d/min_freq" 2>/dev/null || true ;;
   prio)                               # prio <pid>  (OOM-Schutz + Vorrang, nur für Prozesse des Aufrufers)
     isnum "${1:-}" || die "PID erwartet"
     owner=$(stat -c %U "/proc/$1" 2>/dev/null) || die "kein Prozess"
@@ -60,6 +69,6 @@ case "$cmd" in
     echo "$svc" | grep -Eq "$NAME_RE" && [ -x "/etc/init.d/$svc" ] || die "unbekannter Dienst: $svc"
     case "$act" in start|stop|restart|status) exec rc-service "$svc" "$act" ;; *) die "start|stop|restart|status";; esac ;;
   ''|-h|--help)
-    sed -n '2,5p' "$0"; echo "Befehle: brightness N | cpumin on|off | prio PID | kmsgrab scharf|land|port | kmsgrab-running | kmsgrab-stop [kill] | apk add|del P… | apk update | rc-service S start|stop|restart|status" ;;
+    sed -n '2,5p' "$0"; echo "Befehle: brightness N | cpumin on|off | gpumin on|off | prio PID | kmsgrab scharf|land|port | kmsgrab-running | kmsgrab-stop [kill] | apk add|del P… | apk update | rc-service S start|stop|restart|status" ;;
   *) die "unbekannter Befehl: $cmd (alles andere: Harry per doas mit Passwort)" ;;
 esac

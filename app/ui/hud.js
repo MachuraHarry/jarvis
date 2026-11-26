@@ -96,25 +96,12 @@ function drawGraphs() {
     x.textAlign = 'left';
   });
 }
-// GRAPH_FPS = 0 -> mit der Bildwiederholrate des Displays (requestAnimationFrame, bis 60 fps, am flüssigsten)
-let graphRun = false, fpsN = 0, fpsT = performance.now(); window.graphFps = 0;
-function graphLoop() {
-  if (!graphRun) return;
-  drawGraphs(); fpsN++;
-  const t = performance.now(); if (t - fpsT >= 2000) { window.graphFps = Math.round(fpsN * 1000 / (t - fpsT)); fpsN = 0; fpsT = t; }
-  requestAnimationFrame(graphLoop);
-}
-function startGraphs() {
-  if (!$('#spark')) return;          // Systemgraph entfernt (Platz für die Uhr)
-  if (GRAPH_FPS > 0) {
-    if (!graphTimer) graphTimer = setInterval(() => { drawGraphs(); fpsN++; const t = performance.now();
-      if (t - fpsT >= 2000) { window.graphFps = Math.round(fpsN * 1000 / (t - fpsT)); fpsN = 0; fpsT = t; } }, 1000 / GRAPH_FPS);
-    return;
-  }
-  if (!graphRun) { graphRun = true; requestAnimationFrame(graphLoop); }
-}
-function stopGraphs() { clearInterval(graphTimer); graphTimer = null; graphRun = false; }
-startGraphs();
+// Der Systemgraph (#spark) wurde entfernt (Platz für die Uhr) -> startGraphs/stopGraphs sind nur noch
+// die Gegenstücke zu startClock/stopClock in setFrozen, ohne eigene Dauerschleife. Die echte
+// fps-Messung für den hb-Herzschlag läuft jetzt in frame() (nur während listening/thinking/speaking aktiv).
+function startGraphs() {}
+function stopGraphs() {}
+window.graphFps = 0;
 const fmtUp = s => { const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + 'd ' : '') + pad(h) + ':' + pad(m); };
 const sigBars = s => s >= 75 ? 4 : s >= 50 ? 3 : s >= 25 ? 2 : s > 0 ? 1 : 0;
 let lastStats = {};
@@ -190,6 +177,7 @@ function weather(w) {
 const FPS = 20, N = 72, bars = new Float32Array(N);
 const SPEED = { idle: 0, listening: 2.2, thinking: 4, speaking: 1.4, boot: 0, error: 0 };
 let level = 0, target = 0, state = 'boot', timer = null, rot = 0, waveCol = '#38e8ff';
+let fpsN = 0, fpsT = performance.now();
 const wave = $('#wave'), wx = wave.getContext('2d');
 const rings = [...document.querySelectorAll('#core .ring')].map(e => ({ e, speed: +e.dataset.speed, a: Math.random() * 360 }));
 const reactor = $('#core .reactor');
@@ -202,6 +190,10 @@ function frame() {
   const think = state === 'thinking' ? Math.sin(performance.now() / 160) * .04 : 0;
   reactor.style.transform = `scale(${(.85 + level * .45 + think).toFixed(3)})`;
   drawWave();
+  // Echte Render-Rate der Wellenanimation fürs hb-fps-Feld (jarvis-doctor) -- misst, ob der Timer
+  // tatsächlich mit FPS mithält oder (bei Überlastung) hinterherhinkt; läuft nur während der Animation.
+  fpsN++; const t = performance.now();
+  if (t - fpsT >= 2000) { window.graphFps = Math.round(fpsN * 1000 / (t - fpsT)); fpsN = 0; fpsT = t; }
   if (sp === 0 && level < .004 && target < .004 && !bars.some(b => b > .01)) stopAnim();
 }
 function drawWave() {
@@ -218,7 +210,7 @@ function drawWave() {
   wx.stroke();
 }
 function startAnim() { if (!timer) timer = setInterval(frame, 1000 / FPS); }
-function stopAnim() { clearInterval(timer); timer = null; wx.clearRect(0, 0, wave.width, wave.width); reactor.style.transform = 'scale(.85)'; }
+function stopAnim() { clearInterval(timer); timer = null; wx.clearRect(0, 0, wave.width, wave.width); reactor.style.transform = 'scale(.85)'; window.graphFps = 0; fpsN = 0; fpsT = performance.now(); }
 function pushLevel(v) { if (v > .02) { target = Math.max(target, v); startAnim(); } }
 
 const LABEL = { idle: 'BEREIT', listening: 'ICH HÖRE', thinking: 'ANALYSE', speaking: 'ANTWORT', boot: 'START', micoff: 'STUMM' };

@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""jarvis-phone – Harrys Android-Handy (Pixel 9) per adb über WLAN: finden, koppeln, verbinden, spiegeln.
+
+  jarvis-phone status            verbunden? (adb devices)
+  jarvis-phone connect           automatisch verbinden: sucht das Handy per mDNS (_adb-tls-connect) im WLAN,
+                                 Fallback: Portscan der zuletzt bekannten IP. Kein Abtippen von IP/Port nötig.
+  jarvis-phone pair-qr           Erstkopplung OHNE Abtippen: zeigt einen QR-Code im HUD. Harry scannt ihn am Handy unter
+                                 Einstellungen › System › Entwickleroptionen › Drahtloses Debugging › "Gerät über QR-Code koppeln".
+                                 Jarvis erkennt das Handy per mDNS, koppelt und verbindet automatisch (wartet bis 3 Min.).
+  jarvis-phone pair <IP:Port> <Code>   klassische Kopplung mit 6-stelligem Code
+  jarvis-phone mirror            Live-Bildschirm des Handys im Fenster (scrcpy)
+  jarvis-phone shot [datei.png]  Screenshot vom Handy (Pfad auf stdout) – mit --show als Holo-Karte
+  jarvis-phone shell <befehl>    adb shell auf dem Handy (z.B. "input tap 500 1200", "am start -a android.intent.action.VIEW -d URL")
+Voraussetzung am Handy: Entwickleroptionen › Drahtloses Debugging = an, Handy im selben WLAN.
+"""
+import json, os, random, socket, string, subprocess, sys, time
+
+ADB = '/data/home/opt/bin/adb'
+STATE = os.path.expanduser('~/jarvis/state/phone.json')
+SOCK = '/run/user/%d/jarvis.sock' % os.getuid()
+TMP = os.environ.get('TMPDIR', '/data/home/tmp')
+
+
+def adb(*a, timeout=20):
+    return subprocess.run([ADB, *a], capture_output=True, text=True, timeout=timeout)
+
+
+def hud(msg):
+    try:
+        s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect(SOCK)
+        s.sendall((json.dumps(msg, ensure_ascii=False) + '\n').encode()); s.recv(16); s.close()
+    except OSError:
+        pass
+
+
+def load():
+    try: return json.load(open(STATE))
+    except Exception: return {}
+
+
+def save(**kw):
+    d = load(); d.update(kw); os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    json.dump(d, open(STATE, 'w'), indent=1)
+
+
+def devices():
+    out = adb('devices', '-l').stdout.splitlines()[1:]
+    return [l.split()[0] for l in out if ' device ' in l + ' ']
+
+
+def browse(service, want=None, timeout=8.0):
+    """mDNS-Dienste im WLAN finden -> Liste (name, ip, port)."""
+    from zeroconf import ServiceBrowser, Zeroconf
+    found, zc = [], Zeroconf()
+
+    class L:
+        def add_service(self, z, t, name):
+            info = z.get_service_info(t, name, 3000)
+            if info and info.parsed_addresses():
+                ip = next((a for a in info.parsed_addresses() if ':' not in a), info.parsed_addresses()[0])
+                found.append((name, ip, info.port))
+        update_service = remove_service = lambda *a: None
+
+    ServiceBrowser(zc, service, L())
+    t0 = time.time()
+    try:
+        while time.time() - t0 < timeout:
+            if want and any(want in n for n, _, _ in found):
+                break
+            time.sleep(0.3)
+    finally:
+        zc.close()
+    return found
+
+
+def cmd_status():
+    d = devices()
+    print('verbunden: ' + ', '.join(d) if d else 'nicht verbunden')
+    return 0 if d else 1
+
+
+def cmd_connect(quiet=False):
+    d = devices()
+    if d:
+        print('bereits verbunden: ' + d[0]); return 0
+    for name, ip, port in browse('_adb-tls-connect._tcp.local.', timeout=8):
+        r = adb('connect', '%s:%d' % (ip, port))
+        if 'connected to' in r.stdout:
+            save(ip=ip, port=port, name=name)
+            print('verbunden: %s:%d (per mDNS gefunden)' % (ip, port)); return 0
+    st = load()
+    if st.get('ip'):                                   # Fallback: Portscan der bekannten IP
+        out = subprocess.run(['nmap', '--privileged', '-Pn', '-p', '30000-49999', '--open', '-T4', st['ip']],
+                             capture_output=True, text=True, timeout=90).stdout
+        for line in out.splitlines():
+            if '/tcp' in line and 'open' in line:
+                port = int(line.split('/')[0])
+                if 'connected to' in adb('connect', '%s:%d' % (st['ip'], port)).stdout:
+                    save(port=port); print('verbunden: %s:%d (Portscan)' % (st['ip'], port)); return 0
+    print('NICHT VERBUNDEN – Drahtloses Debugging am Handy an? Noch nie gekoppelt? Dann: jarvis-phone pair-qr')
+    return 1
+
+
+def cmd_pair_qr(wait=180):
+    import qrcode
+    name = 'jarvis-' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    pw = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+    q = qrcode.QRCode(border=3, box_size=14, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    q.add_data('WIFI:T:ADB;S:%s;P:%s;;' % (name, pw)); q.make(fit=True)
+    png = os.path.join(TMP, 'adb-pair-qr.png')
+    q.make_image(fill_color='black', back_color='white').save(png)
+    card = {'type': 'image', 'icon': '📱', 'title': 'Handy koppeln – QR-Code scannen', 'accent': 'amber',
+            'subtitle': 'Einstellungen › System › Entwickleroptionen › Drahtloses Debugging › Gerät über QR-Code koppeln',
+            'src': png, 'caption': 'Warte auf das Handy … (bis zu %d Sekunden)' % wait}
+    subprocess.run([os.path.expanduser('~/jarvis/bin/jarvis-show'), '--id', 'phone-pair', '-'],
+                   input=json.dumps(card), text=True, capture_output=True)
+    print('QR-Code wird angezeigt – warte auf Scan …', flush=True)
+    t0 = time.time()
+    while time.time() - t0 < wait:
+        hits = [h for h in browse('_adb-tls-pairing._tcp.local.', want=name, timeout=5) if name in h[0]]
+        if hits:
+            _, ip, port = hits[0]
+            r = adb('pair', '%s:%d' % (ip, port), pw, timeout=30)
+            ok = 'Successfully paired' in r.stdout
+            print(r.stdout.strip() or r.stderr.strip())
+            if not ok:
+                hud({'cmd': 'show', 'id': 'phone-pair', 'card': {'type': 'text', 'icon': '📱', 'accent': 'red',
+                     'title': 'Kopplung fehlgeschlagen', 'text': (r.stdout + r.stderr).strip()[:400]}})
+                return 1
+            save(ip=ip)
+            time.sleep(2)
+            rc = cmd_connect()
+            hud({'cmd': 'show', 'id': 'phone-pair', 'card': {'type': 'text', 'icon': '📱', 'accent': 'green' if rc == 0 else 'amber',
+                 'title': 'Handy gekoppelt ✓' if rc == 0 else 'Gekoppelt – Verbindung folgt',
+                 'text': 'Gekoppelt mit %s. %s' % (ip, 'Verbindung steht.' if rc == 0 else 'Verbinden mit: jarvis-phone connect')}})
+            return rc
+    hud({'cmd': 'show', 'id': 'phone-pair', 'card': {'type': 'text', 'icon': '📱', 'accent': 'red', 'title': 'Kein Scan erkannt',
+         'text': 'In %d Sekunden hat sich kein Handy gemeldet. Ist es im selben WLAN?' % wait}})
+    print('ZEITÜBERSCHREITUNG – kein Handy hat den Code gescannt'); return 1
+
+
+def need():
+    if not devices() and cmd_connect() != 0:
+        sys.exit(1)
+    return devices()[0]
+
+
+def main(a):
+    if not a or a[0] in ('-h', '--help'):
+        print(__doc__); return 0
+    c = a[0]
+    if c == 'status': return cmd_status()
+    if c == 'connect': return cmd_connect()
+    if c == 'pair-qr': return cmd_pair_qr(int(a[1]) if len(a) > 1 else 180)
+    if c == 'pair':
+        if len(a) != 3: print('jarvis-phone pair <IP:Port> <Code>'); return 2
+        r = adb('pair', a[1], a[2]); print(r.stdout.strip() or r.stderr.strip())
+        if 'Successfully' in r.stdout:
+            save(ip=a[1].split(':')[0]); time.sleep(2); return cmd_connect()
+        return 1
+    if c == 'mirror':
+        dev = need()
+        subprocess.Popen([os.path.expanduser('~/jarvis/bin/jarvis-open'), 'scrcpy', '-s', dev, '--max-size', '1280',
+                          '--max-fps', '30', '--window-title', 'Pixel 9'])
+        print('Spiegelung gestartet (%s)' % dev); return 0
+    if c == 'shot':
+        dev = need()
+        path = next((x for x in a[1:] if not x.startswith('--')), os.path.join(TMP, 'phone-%s.png' % time.strftime('%H%M%S')))
+        with open(path, 'wb') as f:
+            subprocess.run([ADB, '-s', dev, 'exec-out', 'screencap', '-p'], stdout=f, timeout=30)
+        if '--show' in a:
+            subprocess.run([os.path.expanduser('~/jarvis/bin/jarvis-show'), '--image', path, 'Handy-Bildschirm'], capture_output=True)
+        print(path); return 0
+    if c == 'shell':
+        dev = need()
+        r = subprocess.run([ADB, '-s', dev, 'shell', ' '.join(a[1:])], capture_output=True, text=True, timeout=60)
+        print(r.stdout, end=''); print(r.stderr, end='', file=sys.stderr); return r.returncode
+    print('Unbekannter Befehl (jarvis-phone --help)'); return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]) or 0)

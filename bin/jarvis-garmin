@@ -1,0 +1,4 @@
+#!/bin/sh
+# Garmin-Daten (Connect-Cloud, BLE-Live-HF, USB-FIT)
+D="$HOME/jarvis/garmin"
+exec "$D/.venv/bin/python" "$D/garmin.py" "$@"

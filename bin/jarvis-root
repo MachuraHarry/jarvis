@@ -1,0 +1,3 @@
+#!/bin/sh
+# Bequemer Aufruf der Root-Schnittstelle (siehe system/jarvis-root): jarvis-root <befehl> [args]
+exec doas -n /usr/local/libexec/jarvis/jarvis-root "$@"

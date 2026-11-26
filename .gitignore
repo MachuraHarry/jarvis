@@ -1,0 +1,37 @@
+# ── Laufzeit, Logs, Caches ──
+*.log
+*.log.old
+__pycache__/
+*.pyc
+.stop
+.restart
+
+# ── Persönliche/lokale Daten (NIE committen) ──
+config.json
+memory.md
+powerkey.json
+state/
+research/
+screenshots/
+export/
+backup/
+workspace/
+pentest/
+*.bundle
+
+# ── Große Binärdaten (per Skript laden) ──
+models/
+
+# ── Garmin: venvs, Fremdcode, Gesundheitsdaten, Gerätedaten ──
+garmin/.venv/
+garmin/.venv-lab/
+garmin/vendor/
+garmin/data/
+garmin/passkey
+garmin/addr
+*.fit
+
+# ── Secrets, falls je angelegt ──
+.env
+*.pem
+*.key

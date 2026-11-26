@@ -1,0 +1,6 @@
+#!/bin/sh
+# jarvis-timer <sekunden> "Nachricht"  -> Jarvis sagt die Nachricht nach Ablauf an
+[ -z "$1" ] && { echo "usage: jarvis-timer <sek> <text>"; exit 1; }
+S=$1; shift; MSG="${*:-Harry, dein Timer ist abgelaufen.}"
+setsid -f sh -c "sleep $S; jarvis-say \"$MSG\"; jarvis-notify 'J.A.R.V.I.S. Timer' \"$MSG\"" >/dev/null 2>&1
+echo "Timer gesetzt: $S Sekunden"

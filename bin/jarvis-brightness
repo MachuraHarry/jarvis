@@ -1,0 +1,13 @@
+#!/bin/sh
+# jarvis-brightness          -> zeigt Helligkeit in %
+# jarvis-brightness 70|+10|-10
+B=$(ls -d /sys/class/backlight/* | head -1); MAX=$(cat $B/max_brightness); CUR=$(cat $B/brightness)
+P=$((CUR*100/MAX))
+case "$1" in
+  "") ;;
+  +*|-*) P=$((P $(echo $1|cut -c1) $(echo $1|cut -c2-)));;
+  *) P=$1;;
+esac
+[ $P -lt 3 ] && P=3; [ $P -gt 100 ] && P=100
+[ -n "$1" ] && "$(dirname "$0")/jarvis-root" brightness $((P*MAX/100))
+echo "Helligkeit ${P}%"

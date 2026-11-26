@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""jarvis-camera – die beiden Kameras des Tablets (Jarvis' Augen).
+
+  jarvis-camera snap [front|rear] [datei.jpg]   Foto aufnehmen (Auto-Belichtung + Weißabgleich), Pfad auf stdout
+  jarvis-camera show [front|rear] ["Text"]      Foto aufnehmen und als Holo-Karte anzeigen
+  jarvis-camera live [front|rear] [sekunden]    Live-Bild im HUD (Standard 60 s; Ende auch per jarvis-camera stop)
+  jarvis-camera qr   [front|rear] [sekunden]    Live-Bild im HUD + QR-/Barcode-Scan, bis etwas erkannt ist
+                                                (Standard: Rückkamera, 90 s). Ergebnis auf stdout, Typ in der 1. Zeile:
+                                                WIFI / URL / ADB-PAIR / TEXT …
+  jarvis-camera stop                            laufende Live-Ansicht / laufenden Scan beenden
+  jarvis-camera info                            Kameras und Sensoren anzeigen
+
+Technik: Die Sensoren liefern 10-Bit-Bayer-Rohdaten (GRBG) über media-ctl/V4L2 ohne Bildprozessor. Dieses
+Werkzeug stellt Belichtung/Verstärkung selbst ein und entwickelt die Bilder in Python (numpy).
+"""
+import base64, json, os, re, signal, socket, subprocess, sys, tempfile, time
+import numpy as np
+
+CAMS = {
+    'front': {'media': '/dev/media0', 'video': '/dev/video0', 'subdev': '/dev/v4l-subdev0',
+              'sensor': 's5k5e9 5-002d', 'csis': 'Exynos7885 CSIS0', 'full': (2592, 1944), 'fast': (1296, 972),
+              'rotate': 0, 'mirror': True, 'name': 'Frontkamera (Samsung S5K5E9, 5 MP)'},
+    'rear': {'media': '/dev/media1', 'video': '/dev/video1', 'subdev': '/dev/v4l-subdev1',
+             'sensor': 's5k4ha 6-002d', 'csis': 'Exynos7885 CSIS1', 'full': (3264, 2448), 'fast': (1632, 1224),
+             'rotate': 0, 'mirror': False, 'name': 'Rückkamera (Samsung S5K4HA, 8 MP)'},
+}
+BLACK = 64.0                       # Schwarzwert der 10-Bit-Sensoren
+TMP = os.environ.get('TMPDIR', '/data/home/tmp')
+OUT = os.path.expanduser('~/Pictures/jarvis-camera')
+SOCK = '/run/user/%d/jarvis.sock' % os.getuid()
+PIDF = '/run/user/%d/jarvis-camera.pid' % os.getuid()
+STATE = os.path.join(TMP, 'jarvis-camera-ae.json')
+
+
+def die(msg):
+    print(msg, file=sys.stderr); sys.exit(1)
+
+
+def sh(*cmd, timeout=20):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+# ───────────── Sensor einstellen ─────────────
+def setup(cam, mode):
+    c = CAMS[cam]; w, h = c[mode]
+    sh('media-ctl', '-d', c['media'], '-V', '"%s":0 [fmt:SGRBG10_1X10/%dx%d]' % (c['sensor'], w, h))
+    sh('media-ctl', '-d', c['media'], '-V', '"%s":0 [fmt:SGRBG10_1X10/%dx%d]' % (c['csis'], w, h))
+    r = sh('v4l2-ctl', '-d', c['video'], '--set-fmt-video=width=%d,height=%d,pixelformat=BA10' % (w, h))
+    if r.returncode:
+        die('Kamera %s lässt sich nicht einstellen: %s' % (cam, (r.stderr or r.stdout).strip()))
+    return w, h
+
+
+def set_exposure(cam, exp, gain):
+    c = CAMS[cam]
+    sh('v4l2-ctl', '-d', c['subdev'], '-c', 'exposure=%d,analogue_gain=%d' % (exp, gain))
+
+
+_LIM = {}
+
+
+def limits(cam):
+    if cam in _LIM:
+        return _LIM[cam]
+    out = sh('v4l2-ctl', '-d', CAMS[cam]['subdev'], '-l').stdout
+    emax = int((re.search(r'exposure .*?max=(\d+)', out) or [0, 2000])[1])
+    _LIM[cam] = (emax, 512)
+    return _LIM[cam]
+
+
+def load_ae(cam):
+    try:
+        return json.load(open(STATE))[cam]
+    except Exception:
+        return {'exp': limits(cam)[0], 'gain': 128, 'wb': [1.6, 1.0, 1.6]}
+
+
+def save_ae(cam, ae):
+    try:
+        d = json.load(open(STATE))
+    except Exception:
+        d = {}
+    d[cam] = ae
+    json.dump(d, open(STATE, 'w'))
+
+
+def adjust_ae(cam, ae, mean, target=0.30):
+    """Belichtung Richtung Zielhelligkeit regeln: erst Belichtungszeit, dann Verstärkung."""
+    emax, gmax = limits(cam)
+    if mean <= 0.001:
+        mean = 0.001
+    k = max(0.25, min(4.0, target / mean))
+    total = ae['exp'] * ae['gain'] * k
+    exp = int(max(2, min(emax, total / 32)))
+    gain = int(max(32, min(gmax, total / max(exp, 1))))
+    if (exp, gain) != (ae['exp'], ae['gain']):
+        ae['exp'], ae['gain'] = exp, gain
+        set_exposure(cam, exp, gain)
+    return abs(np.log(k)) < 0.25
+
+
+# ───────────── Aufnahme ─────────────
+class Stream:
+    """Dauerhafter V4L2-Stream; liefert Rohbilder als uint16-Arrays."""
+    def __init__(self, cam, mode='fast'):
+        self.cam = cam
+        self.w, self.h = setup(cam, mode)
+        self.size = self.w * self.h * 2
+        self.p = subprocess.Popen(['v4l2-ctl', '-d', CAMS[cam]['video'], '--stream-mmap=4', '--stream-count=0',
+                                   '--stream-to=-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+
+    def read(self):
+        buf = bytearray(); need = self.size
+        while len(buf) < need:
+            chunk = self.p.stdout.read(need - len(buf))
+            if not chunk:
+                raise RuntimeError('Kamerastream beendet')
+            buf += chunk
+        return np.frombuffer(bytes(buf), np.uint16).reshape(self.h, self.w)
+
+    def close(self):
+        try:
+            self.p.terminate(); self.p.wait(timeout=3)
+        except Exception:
+            try: self.p.kill()
+            except Exception: pass
+
+
+def capture_raw(cam, mode, skip=3):
+    s = Stream(cam, mode)
+    try:
+        for _ in range(skip):
+            s.read()
+        return s.read()
+    finally:
+        s.close()
+
+
+# ───────────── Entwicklung ─────────────
+def planes(raw):
+    """GRBG-Bayer -> R, G, B in halber Auflösung (2x2-Binning, schnell und rauscharm)."""
+    r = raw[0::2, 1::2].astype(np.float32)
+    g = (raw[0::2, 0::2].astype(np.float32) + raw[1::2, 1::2]) * 0.5
+    b = raw[1::2, 0::2].astype(np.float32)
+    return [np.clip(x - BLACK, 0, None) / (1023.0 - BLACK) for x in (r, g, b)]
+
+
+GAMMA_LUT = (np.linspace(0, 1, 1024) ** (1 / 2.2) * 255).astype(np.uint8)
+
+
+def develop(raw, ae, cam, fast=False):
+    r, g, b = planes(raw)
+    # Weißabgleich (Gray-World, geglättet über die Zeit)
+    mr, mg, mb = float(r.mean()) + 1e-4, float(g.mean()) + 1e-4, float(b.mean()) + 1e-4
+    wb_new = [mg / mr, 1.0, mg / mb]
+    wb = [0.7 * o + 0.3 * n for o, n in zip(ae.get('wb', wb_new), wb_new)]
+    ae['wb'] = [min(4.0, max(0.25, x)) for x in wb]
+    rgb = np.stack([r * ae['wb'][0], g, b * ae['wb'][2]], axis=-1)
+    luma = float(g.mean())
+    # Helligkeit normieren (99,5%-Perzentil -> weiß), Gamma, leichte Sättigung
+    hi = float(np.percentile(rgb[::8, ::8], 99.5)) or 1.0
+    if fast:                                   # Live: Gamma per Tabelle, ohne Sättigung (~4x schneller)
+        idx = np.clip(rgb * (1023.0 / hi), 0, 1023).astype(np.uint16)
+        img = GAMMA_LUT[idx]
+    else:
+        rgb = np.clip(rgb / hi, 0, 1) ** (1 / 2.2)
+        m = rgb.mean(axis=-1, keepdims=True)
+        rgb = np.clip(m + (rgb - m) * 1.25, 0, 1)
+        img = (rgb * 255).astype(np.uint8)
+    c = CAMS[cam]
+    if c['mirror']:
+        img = img[:, ::-1]
+    if c['rotate']:
+        img = np.rot90(img, k=c['rotate'] // 90)
+    return np.ascontiguousarray(img), luma
+
+
+def gray_full(raw, ae):
+    """Volle Auflösung als Graustufen für QR-Erkennung (Bayer-Muster per Weißabgleich ausgeglichen)."""
+    f = np.clip(raw.astype(np.float32) - BLACK, 0, None)
+    wb = ae.get('wb', [1.6, 1.0, 1.6])
+    f[0::2, 1::2] *= wb[0]; f[1::2, 0::2] *= wb[2]
+    hi = float(np.percentile(f[::8, ::8], 99)) or 1.0
+    return (np.clip(f / hi, 0, 1) ** (1 / 2.2) * 255).astype(np.uint8)
+
+
+def to_jpeg(img, path=None, maxw=None, q=88):
+    import gi
+    gi.require_version('GdkPixbuf', '2.0')
+    from gi.repository import GdkPixbuf, GLib
+    h, w, _ = img.shape
+    pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(img.tobytes()), GdkPixbuf.Colorspace.RGB, False, 8, w, h, w * 3)
+    if maxw and w > maxw:
+        pb = pb.scale_simple(maxw, int(h * maxw / w), GdkPixbuf.InterpType.BILINEAR)
+    if path:
+        pb.savev(path, 'jpeg', ['quality'], [str(q)]); return path
+    ok, buf = pb.save_to_bufferv('jpeg', ['quality'], [str(q)])
+    return buf
+
+
+# ───────────── HUD ─────────────
+def hud(msg):
+    try:
+        s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect(SOCK)
+        s.sendall((json.dumps(msg, ensure_ascii=False) + '\n').encode()); s.recv(16); s.close()
+    except OSError:
+        pass
+
+
+def card_frame(cid, cam, img, title, caption, update, accent='cyan', maxw=900, q=75):
+    uri = 'data:image/jpeg;base64,' + base64.b64encode(to_jpeg(img, maxw=maxw, q=q)).decode()
+    hud({'cmd': 'show', 'id': cid, 'update': update,
+         'card': {'type': 'image', 'icon': '📷', 'title': title, 'subtitle': CAMS[cam]['name'], 'accent': accent,
+                  'src': uri, 'caption': caption}})
+
+
+# ───────────── Befehle ─────────────
+def auto_expose(cam, stream, ae, rounds=6):
+    for _ in range(rounds):
+        raw = stream.read(); stream.read()
+        _, luma = develop(raw, ae, cam)
+        if adjust_ae(cam, ae, luma):
+            break
+
+
+def cmd_snap(cam, path=None, show=False, text=''):
+    ae = load_ae(cam); set_exposure(cam, ae['exp'], ae['gain'])
+    s = Stream(cam, 'fast')
+    try:
+        auto_expose(cam, s, ae)
+    finally:
+        s.close()
+    save_ae(cam, ae)
+    raw = capture_raw(cam, 'full', skip=2)            # volle Auflösung für das eigentliche Foto
+    img, _ = develop(raw, ae, cam)
+    os.makedirs(OUT, exist_ok=True)
+    path = path or os.path.join(OUT, '%s-%s.jpg' % (cam, time.strftime('%Y%m%d-%H%M%S')))
+    to_jpeg(img, path, q=90)
+    if show:
+        card_frame('camera-%s-%d' % (cam, int(time.time())), cam, img, text or 'Foto', os.path.basename(path), False)
+    print(path)
+
+
+def claim():
+    try:
+        old = int(open(PIDF).read()); os.kill(old, signal.SIGTERM); time.sleep(0.8)
+    except Exception:
+        pass
+    open(PIDF, 'w').write(str(os.getpid()))
+
+
+def release():
+    try:
+        if int(open(PIDF).read()) == os.getpid(): os.remove(PIDF)
+    except Exception:
+        pass
+
+
+def classify(data):
+    if data.startswith('WIFI:'):
+        f = dict(re.findall(r'([TSPH]):((?:\\.|[^;])*);', data[5:]))
+        return 'WIFI', 'SSID=%s\nTYP=%s\nPASSWORT=%s\nVERSTECKT=%s' % (f.get('S', ''), f.get('T', ''), f.get('P', ''), f.get('H', 'false'))
+    if data.startswith('WIFI:T:ADB') or data.startswith('WIFI:T:ADB;'):
+        return 'ADB-PAIR', data
+    if re.match(r'https?://', data, re.I):
+        return 'URL', data
+    if data.upper().startswith('BEGIN:VCARD'):
+        return 'KONTAKT', data
+    if data.startswith('otpauth://'):
+        return 'OTP', data
+    return 'TEXT', data
+
+
+def cmd_live(cam, seconds, scan=False):
+    claim()
+    stop = {'v': False}
+    signal.signal(signal.SIGTERM, lambda *a: stop.update(v=True))
+    ae = load_ae(cam); set_exposure(cam, ae['exp'], ae['gain'])
+    s = Stream(cam, 'fast')
+    cid = 'camera-live'
+    title = 'QR-Scan · halte den Code vor die Kamera' if scan else 'Live-Kamera'
+    t0, n, found = time.time(), 0, None
+    tmpd = tempfile.mkdtemp(prefix='qr-', dir=TMP)
+    try:
+        while not stop['v'] and time.time() - t0 < seconds:
+            raw = s.read()
+            img, luma = develop(raw, ae, cam, fast=True)
+            if n % 4 == 0:
+                adjust_ae(cam, ae, luma)
+            left = int(seconds - (time.time() - t0))
+            card_frame(cid, cam, img, title, 'noch %d s · %s' % (left, 'suche Code …' if scan else 'live'), n > 0,
+                       'amber' if scan else 'cyan', maxw=720, q=68)
+            if scan:
+                pgm = os.path.join(tmpd, 'f.pgm')
+                g = gray_full(raw, ae)
+                if CAMS[cam]['mirror']:
+                    g = g[:, ::-1]
+                with open(pgm, 'wb') as f:
+                    f.write(b'P5 %d %d 255\n' % (g.shape[1], g.shape[0])); f.write(np.ascontiguousarray(g).tobytes())
+                r = sh('zbarimg', '-q', '--raw', pgm, timeout=10)
+                if r.returncode == 0 and r.stdout.strip():
+                    found = r.stdout.strip().splitlines()[0]
+                    card_frame(cid, cam, img, 'Code erkannt ✓', found[:120], True, 'green')
+                    break
+            n += 1
+    finally:
+        s.close(); save_ae(cam, ae); release()
+        try:
+            for f in os.listdir(tmpd): os.remove(os.path.join(tmpd, f))
+            os.rmdir(tmpd)
+        except Exception:
+            pass
+    if scan:
+        if not found:
+            print('NICHTS (kein Code erkannt in %d s)' % seconds); sys.exit(2)
+        typ, info = classify(found)
+        print(typ); print(info)
+    else:
+        print('Live-Ansicht beendet nach %d s (%d Bilder, %.1f fps).' % (time.time() - t0, n, n / max(1, time.time() - t0)))
+
+
+def main(a):
+    if not a or a[0] in ('-h', '--help'):
+        print(__doc__); return
+    cmd = a[0]
+    cam = a[1] if len(a) > 1 and a[1] in CAMS else ('rear' if cmd == 'qr' else 'front')
+    rest = [x for x in a[1:] if x not in CAMS]
+    if cmd == 'info':
+        for k, c in CAMS.items():
+            print('%-5s %s  %s  voll %dx%d / schnell %dx%d' % (k, c['name'], c['video'], *c['full'], *c['fast']))
+        return
+    if cmd == 'stop':
+        try:
+            os.kill(int(open(PIDF).read()), signal.SIGTERM); print('gestoppt')
+        except Exception:
+            print('nichts aktiv')
+        return
+    if cmd == 'snap':
+        cmd_snap(cam, rest[0] if rest else None); return
+    if cmd == 'show':
+        cmd_snap(cam, None, True, rest[0] if rest else ''); return
+    if cmd in ('live', 'qr'):
+        secs = int(rest[0]) if rest and rest[0].isdigit() else (90 if cmd == 'qr' else 60)
+        cmd_live(cam, secs, scan=(cmd == 'qr')); return
+    die('Unbekannter Befehl (jarvis-camera --help)')
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])

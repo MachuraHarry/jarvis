@@ -1,0 +1,65 @@
+#!/bin/sh
+# jarvis-root – die EINZIGE Root-Schnittstelle für Jarvis (passwortlos per doas, siehe system/doas-jarvis.conf).
+# Installiert root-eigen nach /usr/local/libexec/jarvis/jarvis-root (nicht von harry beschreibbar!).
+# Jeder Unterbefehl prüft seine Argumente streng; alles andere braucht das Passwort (doas).
+set -eu
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+die() { echo "jarvis-root: $*" >&2; exit 2; }
+isnum() { case "$1" in ''|*[!0-9]*) return 1;; esac; }
+NAME_RE='^[a-z0-9][a-z0-9._+-]{0,63}$'
+TAGV="jarvis-kmsgrab"
+
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  brightness)                         # brightness <rohwert>
+    B=$(ls -d /sys/class/backlight/* | head -1); MAX=$(cat "$B/max_brightness")
+    isnum "${1:-}" && [ "$1" -le "$MAX" ] || die "Wert 0..$MAX erwartet"
+    echo "$1" > "$B/brightness" ;;
+  cpumin)                             # cpumin on|off  (Mindesttakt anheben / Werkseinstellung)
+    for p in /sys/devices/system/cpu/cpufreq/policy*; do
+      case "${1:-}:${p##*/}" in
+        on:policy6) f=1560000 ;; on:*) f=1248000 ;;
+        off:*) f=$(cat "$p/cpuinfo_min_freq") ;;
+        *) die "on|off erwartet" ;;
+      esac
+      echo "$f" > "$p/scaling_min_freq" 2>/dev/null || true
+    done ;;
+  prio)                               # prio <pid>  (OOM-Schutz + Vorrang, nur für Prozesse des Aufrufers)
+    isnum "${1:-}" || die "PID erwartet"
+    owner=$(stat -c %U "/proc/$1" 2>/dev/null) || die "kein Prozess"
+    [ "$owner" = "${DOAS_USER:-x}" ] || die "Prozess gehört nicht ${DOAS_USER:-?}"
+    echo -700 > "/proc/$1/oom_score_adj"; renice -n -5 -p "$1" >/dev/null ;;
+  kmsgrab)                            # kmsgrab scharf|land|port  -> MPEG-TS auf stdout
+    case "${1:-}" in
+      scharf) FR=15; CRF=24; SCALE="scale=flags=fast_bilinear:threads=4" ;;
+      land)   FR=20; CRF=23; SCALE="scale=1280:800:flags=fast_bilinear:threads=4" ;;
+      port)   FR=20; CRF=23; SCALE="scale=800:1280:flags=fast_bilinear:threads=4" ;;
+      *) die "scharf|land|port erwartet" ;;
+    esac
+    exec ffmpeg -hide_banner -loglevel error -nostdin -filter_threads 4 \
+      -device /dev/dri/card1 -f kmsgrab -framerate $FR -i - -copyts \
+      -vf "hwdownload,format=bgr0,$SCALE,format=yuv420p" \
+      -c:v libx264 -preset ultrafast -crf $CRF -g $((FR*2)) -threads 3 \
+      -metadata comment="$TAGV" -f mpegts pipe:1 ;;
+  kmsgrab-running) pgrep -f "comment=$TAGV" >/dev/null ;;
+  kmsgrab-stop)                       # kmsgrab-stop [kill]
+    if [ "${1:-}" = kill ]; then pkill -9 -f "comment=$TAGV" || true; else pkill -INT -f "comment=$TAGV" || true; fi ;;
+  apk)                                # apk add|del <paket…> | apk update   (nur Repo-Pakete, keine Optionen/Dateien)
+    sub="${1:-}"; [ $# -gt 0 ] && shift
+    case "$sub" in
+      update) exec apk update ;;
+      add|del)
+        [ $# -ge 1 ] || die "Paketname fehlt"
+        for p in "$@"; do echo "$p" | grep -Eq "$NAME_RE" || die "ungültiger Paketname: $p"; done
+        exec apk "$sub" -- "$@" ;;
+      *) die "add|del|update erwartet" ;;
+    esac ;;
+  rc-service)                         # rc-service <dienst> start|stop|restart|status
+    svc="${1:-}"; act="${2:-}"
+    echo "$svc" | grep -Eq "$NAME_RE" && [ -x "/etc/init.d/$svc" ] || die "unbekannter Dienst: $svc"
+    case "$act" in start|stop|restart|status) exec rc-service "$svc" "$act" ;; *) die "start|stop|restart|status";; esac ;;
+  ''|-h|--help)
+    sed -n '2,5p' "$0"; echo "Befehle: brightness N | cpumin on|off | prio PID | kmsgrab scharf|land|port | kmsgrab-running | kmsgrab-stop [kill] | apk add|del P… | apk update | rc-service S start|stop|restart|status" ;;
+  *) die "unbekannter Befehl: $cmd (alles andere: Harry per doas mit Passwort)" ;;
+esac

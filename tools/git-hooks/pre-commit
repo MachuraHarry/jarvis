@@ -1,0 +1,19 @@
+#!/bin/sh
+# Pre-commit-Wächter: verhindert, dass Jarvis' Auto-Commits (git add -A) Privates ins öffentliche Repo tragen.
+# Aktiv über: git config core.hooksPath tools/git-hooks
+fail=0
+files=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$files" ] && exit 0
+for f in $files; do
+  case "$f" in
+    config.json|memory.md|state/*|research/*|pentest/*|screenshots/*|export/*|workspace/*|backup/*|models/*|garmin/data/*|garmin/addr|garmin/passkey|*.fit|*.log|.env|*.pem|*.key|*.bundle)
+      echo "pre-commit: privat/lokal, nicht committen: $f"; fail=1 ;;
+  esac
+  [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 2000000 ] && { echo "pre-commit: Datei > 2 MB: $f"; fail=1; }
+done
+# Inhalte: Schlüssel/Tokens/private Muster (nur hinzugefügte Zeilen)
+pat='AIza[0-9A-Za-z_-]{35}|sk-ant-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|xox[abp]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|"(password|passwd|secret|token|api_key)"\s*:\s*"[^"]{6,}"'
+hits=$(git diff --cached -U0 --no-color -- . ':!tools/git-hooks/pre-commit' ':!hooks/guard.py' ':!tests/selftest.py' | grep -E '^\+[^+]' | grep -nE "$pat")
+[ -n "$hits" ] && { echo "pre-commit: mögliches Secret im Diff:"; echo "$hits" | cut -c1-120; fail=1; }
+[ $fail = 0 ] || echo "pre-commit: Commit blockiert. Datei aus dem Index nehmen (git rm --cached) bzw. Secret entfernen."
+exit $fail

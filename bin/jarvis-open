@@ -1,0 +1,6 @@
+#!/bin/sh
+# Startet eine GUI-App losgelöst im Hintergrund. Beispiel: jarvis-open firefox https://wetter.de
+export DISPLAY=${DISPLAY:-:0}
+[ $# -eq 0 ] && { echo "usage: jarvis-open <befehl> [args]"; exit 1; }
+setsid -f "$@" >/dev/null 2>&1 </dev/null
+echo "gestartet: $*"

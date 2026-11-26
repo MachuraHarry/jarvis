@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""jarvis-doctor [--card] [--json]
+Systemdiagnose für Jarvis: Prozesse, Gehirn, Ohren, Stimme, Netz, Speicher, HUD, Wächter/Selbsttest, git-Stand.
+Ausgabe: eine Zeile pro Prüfung (OK / WARN / FEHLER). --card zeigt das Ergebnis zusätzlich als HUD-Karte."""
+import json, os, shutil, socket, subprocess, sys, time
+
+J = os.path.expanduser('~/jarvis')
+UID = os.getuid()
+RES = []   # (level, name, detail)
+
+
+def add(level, name, detail=''):
+    RES.append((level, name, str(detail)))
+
+
+def sh(cmd, timeout=10):
+    try:
+        r = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return 99, str(e)
+
+
+def tcp(host, port=443, timeout=4):
+    try:
+        socket.create_connection((host, port), timeout).close(); return True
+    except Exception:
+        return False
+
+
+def health():
+    try:
+        s = socket.socket(socket.AF_UNIX); s.settimeout(5)
+        s.connect('/run/user/%d/jarvis.sock' % UID); s.sendall(b'{"cmd":"health"}\n')
+        d = b''
+        while not d.endswith(b'\n'):
+            c = s.recv(65536)
+            if not c: break
+            d += c
+        if d.strip() == b'ok':
+            return {'_err': 'laufende Jarvis-Version kennt "health" noch nicht – Neustart nötig'}
+        return json.loads(d.decode())
+    except Exception as e:
+        return {'_err': str(e)}
+
+
+# ── Prozesse ──
+rc, out = sh(['pgrep', '-f', 'python3 app/jarvis.py'])
+add('OK' if rc == 0 else 'FEHLER', 'Jarvis-Prozess', 'läuft (PID %s)' % out.split()[0] if rc == 0 else 'läuft nicht')
+rc, _ = sh(['pgrep', '-f', 'jarvis/run.sh'])
+add('OK' if rc == 0 else 'WARN', 'Neustart-Wächter run.sh', 'aktiv' if rc == 0 else 'läuft nicht – kein Auto-Neustart nach Absturz')
+
+h = health()
+if '_err' in h:
+    add('FEHLER', 'Steuer-Socket', h['_err'])
+else:
+    add('OK' if h['brain_alive'] else 'WARN', 'Gehirn',
+        '%s, %s, Runde %d/%d' % (h['model'], 'läuft seit %d s' % h['brain_age_s'] if h['brain_alive'] else 'nicht gestartet (startet bei nächster Frage)',
+                                 h['brain_turns'], h['brain_max_turns']))
+    add('OK' if h['ears'] else 'FEHLER', 'Ohren (Vosk)', 'Modus %s, Mikro %s' % (h['ears_mode'], 'an' if h['mic_on'] else 'AUS'))
+    add('WARN' if h['edge_down'] else 'OK', 'Stimme', '%s%s' % (h['tts'], ' – Edge gestört, Piper-Reserve aktiv' if h['edge_down'] else ''))
+    hb = h['hud_hb_age_s']
+    lvl = 'FEHLER' if (hb is None or hb > 30) else 'WARN' if h['hud_crashes_10min'] else 'OK'
+    add(lvl, 'HUD', 'Herzschlag vor %s s, %s fps, %d Abstürze/10 min%s' % (hb, h['hud_fps'], h['hud_crashes_10min'],
+                                                                         ', Software-Darstellung' if h['software_render'] else ''))
+
+# ── Gehirn-Binary ──
+claude = shutil.which('claude') or os.path.expanduser('~/.local/bin/claude')
+rc, out = sh([claude, '--version'], 20)
+add('OK' if rc == 0 else 'FEHLER', 'claude CLI', out.splitlines()[0] if out else 'nicht gefunden')
+try:
+    tail = open(os.path.join(J, 'brain.log'), errors='replace').read().splitlines()[-30:]
+    errs = [l for l in tail if any(k in l.lower() for k in ('error', 'fehler', 'traceback', 'exception'))]
+    if errs:
+        add('WARN', 'brain.log', errs[-1][:160])
+except FileNotFoundError:
+    pass
+
+# ── Audio ──
+rc, out = sh(['pactl', 'info'])
+add('OK' if rc == 0 else 'FEHLER', 'PulseAudio', 'erreichbar' if rc == 0 else out[:120])
+add('OK' if os.path.isdir(os.path.join(J, 'models', 'vosk-model-small-de-0.15')) else 'FEHLER', 'Vosk-Modell')
+# Root-Begrenzung: jarvis-root passwortlos ok, pauschales Root NICHT passwortlos
+rc_h, _ = sh(['doas', '-n', '/usr/local/libexec/jarvis/jarvis-root', '--help'])
+rc_r, _ = sh(['doas', '-n', 'true'])
+st = os.stat('/usr/local/libexec/jarvis/jarvis-root') if os.path.exists('/usr/local/libexec/jarvis/jarvis-root') else None
+if rc_h != 0 or not st or st.st_uid != 0 or st.st_mode & 0o022:
+    add('FEHLER', 'Root-Helfer jarvis-root', 'fehlt oder nicht root-eigen – doas sh system/install.sh')
+elif rc_r == 0:
+    add('WARN', 'Root-Begrenzung', 'pauschales Root ohne Passwort aktiv – doas sh system/install.sh --activate')
+else:
+    add('OK', 'Root-Begrenzung', 'nur jarvis-root passwortlos')
+rc, out = sh(['git', '-C', J, 'config', 'core.hooksPath'])
+add('OK' if out == 'tools/git-hooks' else 'WARN', 'Pre-commit-Wächter', out or 'nicht aktiv – git config core.hooksPath tools/git-hooks')
+
+# ── Netz ──
+rc, out = sh(['nmcli', '-t', '-f', 'STATE', 'general'])
+online = out.startswith('connected')
+add('OK' if online else 'WARN', 'Netzwerk', out or 'unbekannt')
+if online:
+    for name, host in (('Claude API', 'api.anthropic.com'), ('Edge-Stimme', 'speech.platform.bing.com'),
+                       ('Google-Spracherkennung', 'www.google.com')):
+        add('OK' if tcp(host) else 'FEHLER', name, host)
+
+# ── Speicher ──
+for mnt, warn_mb in (('/', 250), ('/data', 1000)):
+    st = os.statvfs(mnt); free = st.f_bavail * st.f_frsize // 1048576
+    add('OK' if free > warn_mb else 'WARN', 'Speicher %s' % mnt, '%d MB frei' % free)
+mi = {l.split(':')[0]: int(l.split()[1]) for l in open('/proc/meminfo')}
+add('OK' if mi['MemAvailable'] > 200_000 else 'WARN', 'RAM', '%d MB verfügbar' % (mi['MemAvailable'] // 1024))
+
+# ── Selbsttest + git ──
+rc, out = sh([sys.executable, os.path.join(J, 'tests', 'selftest.py')], 60)
+add('OK' if rc == 0 else 'FEHLER', 'Selbsttest', out.splitlines()[0] if out else '')
+rc, dirty = sh(['git', '-C', J, 'status', '--porcelain'])
+rc2, head = sh(['git', '-C', J, 'rev-parse', '--short', 'HEAD'])
+rc3, good = sh(['git', '-C', J, 'rev-parse', '--short', 'good'])
+if rc2 == 0:
+    d = len([l for l in dirty.splitlines() if l.strip()])
+    add('OK' if not d and head == good else 'WARN', 'Code-Stand',
+        'HEAD %s, good %s%s' % (head, good, ', %d ungespeicherte Änderungen' % d if d else ''))
+try:
+    last = open(os.path.join(J, 'restart.log')).read().strip().splitlines()[-1]
+    add('WARN' if ('FEHLSTART' in last or 'Rollback' in last) else 'OK', 'Letzter Neustart', last[:160])
+except Exception:
+    pass
+
+# ── Ausgabe ──
+if '--json' in sys.argv:
+    print(json.dumps([{'level': l, 'name': n, 'detail': d} for l, n, d in RES], ensure_ascii=False, indent=1))
+else:
+    for l, n, d in RES:
+        print('%-6s %-24s %s' % (l, n, d))
+bad = [r for r in RES if r[0] != 'OK']
+if '--card' in sys.argv:
+    card = {'type': 'list', 'id': 'doctor', 'title': 'Systemdiagnose', 'icon': '🩺',
+            'accent': 'red' if any(r[0] == 'FEHLER' for r in RES) else 'amber' if bad else 'green',
+            'subtitle': '%d Prüfungen, %d Auffälligkeiten' % (len(RES), len(bad)),
+            'items': [{'title': n, 'sub': d, 'badge': l} for l, n, d in sorted(RES, key=lambda r: ('FEHLER', 'WARN', 'OK').index(r[0]))]}
+    subprocess.run([os.path.join(J, 'bin', 'jarvis-show'), '-'], input=json.dumps(card, ensure_ascii=False), text=True,
+                   capture_output=True, timeout=15)
+sys.exit(1 if any(r[0] == 'FEHLER' for r in RES) else 0)

@@ -1,0 +1,9 @@
+#!/bin/sh
+# Kompakter Systemstatus
+B=/sys/class/power_supply/s2mu005-fg
+echo "Akku: $(cat $B/capacity 2>/dev/null)% ($(cat /sys/class/power_supply/s2mu005-charger/status 2>/dev/null))"
+echo "RAM: $(free -m | awk '/Mem/{print $3"/"$2" MB"}')  Swap: $(free -m | awk '/Swap/{print $3"/"$2" MB"}')"
+echo "Last: $(cut -d' ' -f1-3 /proc/loadavg)  Uptime: $(uptime | sed 's/.*up \([^,]*\),.*/\1/')"
+echo "Speicher /: $(df -hP / | awk 'NR==2{print $4" frei"}')  /data: $(df -hP /data | awk 'NR==2{print $4" frei"}')"
+echo "WLAN: $(nmcli -t -f active,ssid,signal dev wifi 2>/dev/null | grep '^yes' | cut -d: -f2-)"
+echo "CPU: $(( $(cat /sys/class/thermal/thermal_zone1/temp)/1000 ))°C  GPU: $(( $(cat /sys/class/thermal/thermal_zone2/temp)/1000 ))°C  Akku: $(( $(cat /sys/class/thermal/thermal_zone0/temp)/1000 ))°C"

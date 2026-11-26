@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""jarvis-show – zeigt aufbereitete Ergebnisse als Holo-Karte im Jarvis-HUD (rechtes Panel, Reiter "Anzeige").
+
+EIGENE KARTE (JSON, siehe ~/jarvis/docs/show.md):
+  jarvis-show - <<'EOF'
+  {"type":"list","title":"…","icon":"📦","items":[{"title":"…","sub":"…","meta":"…"}]}
+  EOF
+  jarvis-show karte.json
+  jarvis-show --image <pfad> ["Bildunterschrift"]
+
+FERTIGE PRESETS (holen die Daten selbst, schnell; geben eine Kurzfassung zum Vorlesen auf stdout aus):
+  jarvis-show --preset mail [N]              ungelesene Mails im Posteingang
+  jarvis-show --preset mail-search "<gmail-suche>" [N]
+  jarvis-show --preset mail-read <messageId> eine Mail als Lesekarte
+  jarvis-show --preset agenda [today|tomorrow|week]
+  jarvis-show --preset whatsapp              ungelesene WhatsApp-Chats (synct vorher)
+  jarvis-show --preset chat <JID|Nummer|exakter Name> [N]   WhatsApp-Verlauf als Chat-Blasen
+  jarvis-show --preset weather               Wetter jetzt, 24 Stunden, 7 Tage
+  jarvis-show --preset briefing              Dashboard: Wetter, Termine heute, Mails, WhatsApp
+  jarvis-show --preset system                Tablet-Zustand als Kacheln
+
+Optionen:  --json (Karte nur ausgeben, nicht anzeigen)   --clear (alle Karten entfernen)
+           --id <name> (gleiche id ersetzt die alte Karte)   --background (Reiter nicht automatisch wechseln)
+"""
+import base64, concurrent.futures as cf, datetime as dt, json, os, re, socket, subprocess, sys, time, urllib.request
+
+HOME = os.path.expanduser('~')
+SOCK = '/run/user/%d/jarvis.sock' % os.getuid()
+BIN = '/data/home/opt/bin/'
+GOG, WACLI = BIN + 'gog', BIN + 'wacli'
+CACHE = os.path.join(HOME, '.cache', 'jarvis-show')
+TYPES = {'list', 'agenda', 'chat', 'read', 'stats', 'chart', 'table', 'text', 'image', 'steps', 'dashboard'}
+WD = ['Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag', 'Sonntag']
+WD2 = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr); sys.exit(code)
+
+
+# ───────────── Hilfen ─────────────
+def run(cmd, timeout=60):
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=CACHE)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout).strip().splitlines()[-1] if (p.stderr or p.stdout).strip() else 'Fehler %d' % p.returncode)
+    return p.stdout
+
+
+def run_json(cmd, timeout=60):
+    out = run(cmd, timeout)
+    i = out.find('{')
+    return json.loads(out[i:]) if i >= 0 else {}
+
+
+def now():
+    return dt.datetime.now().astimezone()
+
+
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        if len(s) == 10:
+            return dt.datetime.fromisoformat(s).replace(tzinfo=now().tzinfo)
+        return dt.datetime.fromisoformat(s.replace('Z', '+00:00')).astimezone()
+    except Exception:
+        return None
+
+
+def rel_day(d):
+    t = now().date(); dd = d.date() if isinstance(d, dt.datetime) else d
+    if dd == t: return 'Heute'
+    if dd == t + dt.timedelta(days=1): return 'Morgen'
+    if dd == t - dt.timedelta(days=1): return 'Gestern'
+    return '%s, %s' % (WD[dd.weekday()], dd.strftime('%d.%m.'))
+
+
+def short_time(d):
+    if not d: return ''
+    if d.date() == now().date(): return d.strftime('%H:%M')
+    if (now().date() - d.date()).days < 7: return WD2[d.weekday()] + ' ' + d.strftime('%H:%M')
+    return d.strftime('%d.%m.')
+
+
+def sender_name(s):
+    m = re.match(r'\s*"?([^"<]+?)"?\s*<', s or '')
+    return (m.group(1) if m else (s or '')).strip() or (s or '?')
+
+
+def clip(s, n):
+    s = re.sub(r'[\s ]+', ' ', str(s or '')).strip()
+    return s if len(s) <= n else s[:n - 1].rstrip() + '…'
+
+
+def plural(n, one, many):
+    return '%s %s' % ({1: 'eine', 0: 'keine'}.get(n, str(n)), one if n == 1 else many)
+
+
+# ───────────── Validierung ─────────────
+def image_uri(path, maxpx=1000):
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        raise ValueError('Bild nicht gefunden: %s' % path)
+    import gi
+    gi.require_version('GdkPixbuf', '2.0')
+    from gi.repository import GdkPixbuf
+    pb = GdkPixbuf.Pixbuf.new_from_file(path)
+    w, h = pb.get_width(), pb.get_height()
+    f = min(1.0, maxpx / max(w, h))
+    if f < 1:
+        pb = pb.scale_simple(int(w * f), int(h * f), GdkPixbuf.InterpType.BILINEAR)
+    ok, buf = pb.save_to_bufferv('jpeg', ['quality'], ['85'])
+    return 'data:image/jpeg;base64,' + base64.b64encode(buf).decode()
+
+
+IMG_MAX = 3_000_000          # eingebettete Bilder (data:image/…;base64) dürfen groß sein – nie kürzen!
+
+
+def sanitize(v, depth=0):
+    if depth > 6: return None
+    if isinstance(v, str):
+        if v.startswith('data:image/'):
+            if len(v) > IMG_MAX:
+                raise ValueError('Bild zu groß (%d KB) – bitte kleiner skalieren' % (len(v) // 1024))
+            return v
+        return v[:6000]
+    if isinstance(v, (int, float, bool)) or v is None: return v
+    if isinstance(v, list): return [sanitize(x, depth + 1) for x in v[:60]]
+    if isinstance(v, dict): return {str(k)[:40]: sanitize(x, depth + 1) for k, x in list(v.items())[:40]}
+    return str(v)[:500]
+
+
+def validate(card):
+    if not isinstance(card, dict): raise ValueError('Karte muss ein JSON-Objekt sein')
+    if card.get('type') not in TYPES: raise ValueError('Unbekannter type %r – erlaubt: %s' % (card.get('type'), ', '.join(sorted(TYPES))))
+    if card['type'] == 'image' and card.get('src') and not str(card['src']).startswith('data:image/'):
+        card['src'] = image_uri(card['src'])
+    if card['type'] == 'dashboard':
+        cells = []
+        for c in card.get('cells') or []:
+            if isinstance(c, dict) and c.get('type') in TYPES - {'dashboard'}:
+                cells.append(validate(c))
+        card['cells'] = cells
+    return sanitize(card)
+
+
+def send(card, cid, focus=True):
+    msg = json.dumps({'cmd': 'show', 'id': cid, 'card': card, 'focus': focus}, ensure_ascii=False) + '\n'
+    if len(msg) > 4_000_000: raise ValueError('Karte zu groß')
+    s = socket.socket(socket.AF_UNIX); s.settimeout(5)
+    try:
+        s.connect(SOCK); s.sendall(msg.encode()); s.recv(16)
+    except OSError as e:
+        raise RuntimeError('Jarvis-HUD nicht erreichbar (%s)' % e)
+    finally:
+        s.close()
+
+
+# ───────────── Presets ─────────────
+CAT = {'CATEGORY_SOCIAL': 'Social', 'CATEGORY_UPDATES': 'Updates', 'CATEGORY_PROMOTIONS': 'Werbung', 'CATEGORY_FORUMS': 'Foren'}
+
+
+def mail_list(query, n, title, icon='✉️', cid='mail'):
+    d = run_json([GOG, 'gmail', 'search', query, '--max', str(n), '--json'])
+    th = d.get('threads') or []
+    items = []
+    for t in th:
+        labels = t.get('labels') or []
+        cat = next((CAT[l] for l in labels if l in CAT), 'Primär')
+        items.append({'title': sender_name(t.get('from')), 'sub': clip(t.get('subject') or '(kein Betreff)', 160),
+                      'meta': short_time(parse_ts(t.get('internalDateIso'))), 'badge': cat,
+                      'unread': 'UNREAD' in labels, 'count': t.get('messageCount') if (t.get('messageCount') or 1) > 1 else None,
+                      'ask': 'Zeig mir die Mail %s an (jarvis-show --preset mail-read %s)' % (t.get('id'), t.get('id'))})
+    prim = [i for i in items if i['badge'] == 'Primär']
+    more = ' (+ weitere)' if d.get('has_more') else ''
+    card = {'type': 'list', 'icon': icon, 'title': title, 'subtitle': '%d Treffer%s' % (len(items), more) if items else '',
+            'items': items, 'empty': 'Keine Mails – alles erledigt ✓', 'footer': 'Antippen zum Öffnen'}
+    if not items:
+        summary = 'Keine Mails gefunden.'
+    else:
+        top = prim[0] if prim else items[0]
+        summary = '%d Mails%s. %s davon persönlich (Primär). Oberste: %s – %s.' % (len(items), more, len(prim) or 'Keine', top['title'], top['sub'])
+    return card, cid, summary
+
+
+def p_mail(args):
+    n = int(args[0]) if args else 10
+    return mail_list('is:unread in:inbox', n, 'Posteingang · ungelesen')
+
+
+def p_mail_search(args):
+    if not args: die('mail-search "<gmail-suche>" [N]')
+    return mail_list(args[0], int(args[1]) if len(args) > 1 else 10, 'Mails · ' + clip(args[0], 40), '🔎', 'mail-search')
+
+
+def p_mail_read(args):
+    if not args: die('mail-read <messageId>')
+    m = run_json([GOG, 'gmail', 'get', args[0], '--sanitize-content', '--json'])['message']
+    h = m.get('headers') or {}
+    body = str(m.get('body') or m.get('snippet') or '').replace(' ', ' ')
+    body = re.sub(r'[ \t]{2,}', ' ', body)
+    body = re.sub(r'\n{3,}', '\n\n', body).strip()
+    d = dt.datetime.fromtimestamp(int(m.get('internalDate', 0)) / 1000).astimezone() if m.get('internalDate') else None
+    card = {'type': 'read', 'icon': '📨', 'title': sender_name(h.get('from')), 'subtitle': rel_day(d) + ' · ' + d.strftime('%H:%M') if d else '',
+            'from': h.get('from', ''), 'to': h.get('to', ''), 'date': d.strftime('%d.%m.%Y %H:%M') if d else h.get('date', ''),
+            'subject': h.get('subject', ''), 'body': body[:12000],
+            'actions': [{'label': 'Zusammenfassen', 'ask': 'Fasse mir die Mail %s kurz zusammen' % args[0]},
+                        {'label': 'Antwort entwerfen', 'ask': 'Entwirf eine Antwort auf die Mail %s und zeig sie mir, aber sende noch nichts' % args[0]},
+                        {'label': 'Als gelesen', 'ask': 'Markiere die Mail %s als gelesen' % args[0]}]}
+    return card, 'mail-read', 'Mail von %s: %s.' % (sender_name(h.get('from')), h.get('subject', ''))
+
+
+def calendar_names():
+    p = os.path.join(CACHE, 'calendars.json')
+    try:
+        if time.time() - os.path.getmtime(p) < 86400:
+            return json.load(open(p))
+    except Exception:
+        pass
+    try:
+        d = run_json([GOG, 'calendar', 'calendars', '--json'])
+        names = {c['id']: c.get('summary') or c['id'] for c in d.get('calendars', [])}
+        for k, v in list(names.items()):
+            if '@' in v and '.' in v: names[k] = 'Mein Kalender'
+            if 'holiday' in k: names[k] = 'Feiertag'
+        json.dump(names, open(p, 'w'))
+        return names
+    except Exception:
+        return {}
+
+
+def agenda_events(rng):
+    flag = {'today': '--today', 'heute': '--today', 'tomorrow': '--tomorrow', 'morgen': '--tomorrow', 'week': '--week', 'woche': '--week'}.get(rng, '--today')
+    with cf.ThreadPoolExecutor(2) as ex:
+        fe = ex.submit(run_json, [GOG, 'calendar', 'events', flag, '--all', '--max', '50', '--json'])
+        fn = ex.submit(calendar_names)
+        d, names = fe.result(), fn.result()
+    evs, t = [], now()
+    for e in d.get('events') or []:
+        st, en = e.get('startLocal') or (e.get('start') or {}).get('dateTime') or (e.get('start') or {}).get('date'), \
+            e.get('endLocal') or (e.get('end') or {}).get('dateTime') or (e.get('end') or {}).get('date')
+        s, f = parse_ts(st), parse_ts(en)
+        if not s: continue
+        allday = len(st or '') == 10
+        evs.append({'_s': s, 'day': rel_day(s), 'allday': allday, 'start': '' if allday else s.strftime('%H:%M'),
+                    'end': '' if allday or not f else f.strftime('%H:%M'), 'title': e.get('summary') or '(ohne Titel)',
+                    'place': clip(e.get('location'), 60) if e.get('location') else '',
+                    'calendar': names.get(e.get('calendarId'), ''),
+                    'now': (not allday and f is not None and s <= t <= f),
+                    'past': (not allday and f is not None and f < t)})
+    evs.sort(key=lambda x: (x['_s'].date(), not x['allday'], x['_s']))
+    for x in evs: x.pop('_s')
+    return evs, flag
+
+
+def p_agenda(args):
+    rng = (args[0] if args else 'today').lower()
+    evs, flag = agenda_events(rng)
+    title = {'--today': 'Termine heute', '--tomorrow': 'Termine morgen', '--week': 'Termine diese Woche'}[flag]
+    upcoming = [e for e in evs if not e['past']]
+    card = {'type': 'agenda', 'icon': '🗓️', 'title': title, 'subtitle': plural(len(evs), 'Termin', 'Termine'),
+            'events': evs, 'empty': 'Keine Termine – freie Bahn ✓'}
+    if not evs:
+        summary = '%s: keine Termine.' % title
+    else:
+        nx = upcoming[0] if upcoming else evs[0]
+        summary = '%s: %s. Nächster: %s%s%s.' % (title, plural(len(evs), 'Termin', 'Termine'), nx['title'],
+                                                ' ' + nx['day'].lower() if flag == '--week' else '',
+                                                ' um ' + nx['start'] if nx['start'] else ' (ganztägig)')
+    return card, 'agenda-' + flag[2:], summary
+
+
+def wa_sync():
+    try:
+        run([WACLI, 'sync', '--once', '--idle-exit', '5s', '--lock-wait', '20s'], timeout=90)
+        return True
+    except Exception:
+        return False
+
+
+def wa_unread(sync=True):
+    synced = wa_sync() if sync else None
+    d = run_json([WACLI, 'chats', 'list', '--unread', '--limit', '30', '--json'])
+    chats = d.get('data') or []
+    return chats, synced
+
+
+def wa_last(jid):
+    try:
+        d = run_json([WACLI, 'messages', 'list', '--chat', jid, '--limit', '1', '--json'])
+        m = (d.get('data') or {}).get('messages') or []
+        return m[0] if m else None
+    except Exception:
+        return None
+
+
+def p_whatsapp(args):
+    chats, synced = wa_unread()
+    items, total = [], 0
+    for c in chats[:12]:
+        last = wa_last(c['jid'])
+        n = c.get('unread_count') or 0
+        total += n
+        sub = ''
+        if last:
+            who = '' if c.get('kind') == 'dm' else (last.get('SenderName') or '') + ': '
+            sub = who + clip(last.get('DisplayText') or last.get('Text') or ('[%s]' % last.get('MediaType') if last.get('MediaType') else ''), 140)
+        items.append({'title': c.get('name') or c['jid'].split('@')[0], 'sub': sub, 'unread': True, 'count': n or None,
+                      'meta': short_time(parse_ts(c.get('last_message_ts'))), 'badge': 'Gruppe' if c.get('kind') == 'group' else None,
+                      'ask': 'Zeig mir den WhatsApp-Chat mit %s (jarvis-show --preset chat %s)' % (c.get('name') or '', c['jid'])})
+    card = {'type': 'list', 'icon': '💬', 'title': 'WhatsApp · ungelesen', 'accent': 'green',
+            'subtitle': '%s in %s' % (plural(total, 'Nachricht', 'Nachrichten'), plural(len(chats), 'Chat', 'Chats')) if chats else '',
+            'items': items, 'empty': 'Keine ungelesenen Nachrichten ✓',
+            'footer': ('Gerade synchronisiert' if synced else 'Sync fehlgeschlagen – zeige lokalen Stand') + ' · Antippen zum Öffnen'}
+    if not chats:
+        summary = 'Keine ungelesenen WhatsApp-Nachrichten.'
+    else:
+        summary = '%s in %s, von: %s.' % (plural(total, 'ungelesene Nachricht', 'ungelesene Nachrichten'),
+                                        plural(len(chats), 'Chat', 'Chats'), ', '.join(i['title'] for i in items[:4]))
+    return card, 'whatsapp', summary
+
+
+def p_chat(args):
+    if not args: die('chat <JID|Nummer|exakter Name> [N]')
+    who, n = args[0], int(args[1]) if len(args) > 1 else 25
+    wa_sync()
+    d = run_json([WACLI, 'messages', 'list', '--chat', who, '--limit', str(n), '--json'])
+    msgs = list(reversed((d.get('data') or {}).get('messages') or []))
+    if not msgs: die('Keine Nachrichten für %s gefunden (exakten Namen/JID mit "wacli chats list --query" suchen)' % who)
+    name = next((m.get('ChatName') for m in msgs if m.get('ChatName')), who)
+    group = str(msgs[0].get('ChatJID', '')).endswith('@g.us')
+    out = []
+    for m in msgs:
+        ts = parse_ts(m.get('Timestamp'))
+        txt = m.get('DisplayText') or m.get('Text') or ''
+        if m.get('MediaType') and not m.get('Text'): txt = {'image': '📷 Bild', 'video': '🎬 Video', 'audio': '🎤 Sprachnachricht', 'document': '📄 Dokument', 'sticker': 'Sticker'}.get(m['MediaType'], txt or m['MediaType'])
+        if m.get('MediaCaption'): txt = (txt + '\n' if txt and txt != m['MediaCaption'] else '') + m['MediaCaption']
+        out.append({'me': bool(m.get('FromMe')), 'from': m.get('SenderName') or '', 'text': txt[:2000],
+                    'time': ts.strftime('%H:%M') if ts else '', 'day': rel_day(ts) if ts else ''})
+    card = {'type': 'chat', 'icon': '💬', 'title': name, 'accent': 'green', 'group': group,
+            'subtitle': 'WhatsApp · letzte %d Nachrichten' % len(out), 'messages': out,
+            'actions': [{'label': 'Zusammenfassen', 'ask': 'Fasse mir den WhatsApp-Chat mit %s kurz zusammen' % name},
+                        {'label': 'Antworten', 'ask': 'Ich möchte %s auf WhatsApp antworten' % name}]}
+    theirs = [m for m in out if not m['me']]
+    last = theirs[-1] if theirs else out[-1]
+    return card, 'chat', 'Chat mit %s. Letzte Nachricht von %s: %s' % (name, 'dir' if last['me'] else (last['from'] or name), clip(last['text'], 120))
+
+
+WMO = {0: ('☀️', 'klar'), 1: ('🌤️', 'überwiegend klar'), 2: ('⛅', 'teils bewölkt'), 3: ('☁️', 'bedeckt'), 45: ('🌫️', 'Nebel'), 48: ('🌫️', 'Reifnebel'),
+       51: ('🌦️', 'leichter Niesel'), 53: ('🌦️', 'Niesel'), 55: ('🌧️', 'starker Niesel'), 56: ('🌧️', 'gefr. Niesel'), 57: ('🌧️', 'gefr. Niesel'),
+       61: ('🌦️', 'leichter Regen'), 63: ('🌧️', 'Regen'), 65: ('🌧️', 'starker Regen'), 66: ('🌧️', 'gefr. Regen'), 67: ('🌧️', 'gefr. Regen'),
+       71: ('🌨️', 'leichter Schnee'), 73: ('🌨️', 'Schnee'), 75: ('❄️', 'starker Schnee'), 77: ('🌨️', 'Schneegriesel'),
+       80: ('🌦️', 'Schauer'), 81: ('🌧️', 'Regenschauer'), 82: ('⛈️', 'heftige Schauer'), 85: ('🌨️', 'Schneeschauer'), 86: ('🌨️', 'Schneeschauer'),
+       95: ('⛈️', 'Gewitter'), 96: ('⛈️', 'Gewitter, Hagel'), 99: ('⛈️', 'Gewitter, Hagel')}
+
+
+def weather_data():
+    try:
+        loc = json.load(open(os.path.join(HOME, 'jarvis', 'config.json'))).get('location') or {}
+    except Exception:
+        loc = {}
+    lat, lon, city = loc.get('lat', 52.52), loc.get('lon', 13.405), loc.get('city', '')
+    url = ('https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s&current=temperature_2m,apparent_temperature,'
+           'relative_humidity_2m,wind_speed_10m,weather_code&hourly=temperature_2m,precipitation_probability'
+           '&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset'
+           '&timezone=auto&forecast_days=7' % (lat, lon))
+    with urllib.request.urlopen(url, timeout=15) as r:
+        return json.load(r), city
+
+
+def weather_cells():
+    w, city = weather_data()
+    c, h, d = w['current'], w['hourly'], w['daily']
+    ico, desc = WMO.get(c['weather_code'], ('🌡️', ''))
+    nowh = now().strftime('%Y-%m-%dT%H:00')
+    i0 = h['time'].index(nowh) if nowh in h['time'] else 0
+    hrs = range(i0, min(i0 + 24, len(h['time'])))
+    rain = max((h['precipitation_probability'][i] or 0) for i in hrs)
+    tiles = {'type': 'stats', 'icon': ico, 'title': '%s · %s' % (city or 'Wetter', desc), 'tiles': [
+        {'label': 'Jetzt', 'value': round(c['temperature_2m']), 'unit': '°C', 'note': 'gefühlt %d°' % round(c['apparent_temperature'])},
+        {'label': 'Heute', 'value': '%d / %d' % (round(d['temperature_2m_min'][0]), round(d['temperature_2m_max'][0])), 'unit': '°C'},
+        {'label': 'Regen 24 h', 'value': rain, 'unit': '%', 'gauge': rain, 'level': 'warn' if rain >= 60 else None},
+        {'label': 'Wind', 'value': round(c['wind_speed_10m']), 'unit': 'km/h', 'note': 'Feuchte %d %%' % c['relative_humidity_2m']}]}
+    hourly = {'type': 'chart', 'kind': 'line', 'icon': '🌡️', 'title': 'Nächste 24 Stunden', 'height': 200,
+              'labels': [h['time'][i][11:13] + 'h' for i in hrs],
+              'series': [{'name': 'Temperatur °C', 'values': [h['temperature_2m'][i] for i in hrs]}]}
+    days = [WD2[dt.date.fromisoformat(x).weekday()] + ' ' + WMO.get(d['weather_code'][j], ('',))[0] for j, x in enumerate(d['time'])]
+    daily = {'type': 'chart', 'kind': 'bar', 'icon': '📊', 'title': '7 Tage', 'labels': days, 'values': False,
+             'series': [{'name': 'Max °C', 'values': [round(v) for v in d['temperature_2m_max']], 'color': '#ffb547'},
+                        {'name': 'Min °C', 'values': [round(v) for v in d['temperature_2m_min']], 'color': '#38e8ff'}]}
+    summary = 'In %s gerade %d Grad, %s. Heute %d bis %d Grad, Regenrisiko %d Prozent.' % (
+        city or 'deiner Gegend', round(c['temperature_2m']), desc, round(d['temperature_2m_min'][0]), round(d['temperature_2m_max'][0]), rain)
+    return tiles, hourly, daily, summary
+
+
+def p_weather(args):
+    tiles, hourly, daily, summary = weather_cells()
+    tiles['wide'] = hourly['wide'] = daily['wide'] = True
+    card = {'type': 'dashboard', 'icon': tiles['icon'], 'title': 'Wetter', 'subtitle': tiles['title'], 'cells': [tiles, hourly, daily],
+            'footer': 'Quelle: Open-Meteo · ' + now().strftime('%H:%M')}
+    return card, 'weather', summary
+
+
+def p_briefing(args):
+    jobs = {}
+    with cf.ThreadPoolExecutor(4) as ex:
+        jobs['weather'] = ex.submit(weather_cells)
+        jobs['agenda'] = ex.submit(agenda_events, 'today')
+        jobs['mail'] = ex.submit(run_json, [GOG, 'gmail', 'search', 'is:unread in:inbox', '--max', '20', '--json'])
+        jobs['wa'] = ex.submit(wa_unread)
+    res, cells, said = {}, [], []
+    for k, f in jobs.items():
+        try: res[k] = f.result()
+        except Exception as e: res[k] = e
+    h = now().hour
+    greet = 'Guten Morgen' if h < 11 else 'Guten Tag' if h < 18 else 'Guten Abend'
+    if not isinstance(res['weather'], Exception):
+        tiles, hourly, daily, ws = res['weather']
+        tiles['wide'] = True; tiles['tiles'] = tiles['tiles'][:3]; cells.append(tiles); said.append(ws)
+    if not isinstance(res['agenda'], Exception):
+        evs, _ = res['agenda']
+        cells.append({'type': 'agenda', 'icon': '🗓️', 'title': 'Heute', 'badge': str(len(evs)) if evs else None, 'events': evs[:6], 'empty': 'Keine Termine'})
+        up = [e for e in evs if not e['past']]
+        said.append('Heute %s%s.' % (plural(len(evs), 'Termin', 'Termine'), (', als nächstes ' + up[0]['title'] + (' um ' + up[0]['start'] if up[0]['start'] else '')) if up else ''))
+    if not isinstance(res['mail'], Exception):
+        th = res['mail'].get('threads') or []
+        prim = [t for t in th if not any(l in CAT for l in t.get('labels') or [])]
+        cells.append({'type': 'list', 'icon': '✉️', 'title': 'Mails', 'badge': str(len(th)) if th else None, 'empty': 'Posteingang leer ✓',
+                      'items': [{'title': sender_name(t.get('from')), 'sub': clip(t.get('subject'), 80), 'unread': True,
+                                 'ask': 'Zeig mir die Mail %s an (jarvis-show --preset mail-read %s)' % (t['id'], t['id'])} for t in (prim or th)[:4]]})
+        said.append('%s, %d davon persönlich.' % (plural(len(th), 'ungelesene Mail', 'ungelesene Mails'), len(prim)) if th else 'Keine neuen Mails.')
+    if not isinstance(res['wa'], Exception):
+        chats, _ = res['wa']
+        tot = sum(c.get('unread_count') or 0 for c in chats)
+        cells.append({'type': 'list', 'icon': '💬', 'title': 'WhatsApp', 'accent': 'green', 'badge': str(tot) if tot else None, 'empty': 'Nichts Ungelesenes ✓',
+                      'items': [{'title': c.get('name') or c['jid'].split('@')[0], 'count': c.get('unread_count') or None, 'unread': True,
+                                 'ask': 'Zeig mir den WhatsApp-Chat mit %s (jarvis-show --preset chat %s)' % (c.get('name') or '', c['jid'])} for c in chats[:4]]})
+        said.append('%s auf WhatsApp.' % plural(tot, 'ungelesene Nachricht', 'ungelesene Nachrichten'))
+    errs = [k for k, v in res.items() if isinstance(v, Exception)]
+    t = now()
+    card = {'type': 'dashboard', 'icon': '🛰️', 'title': greet + ', ' + _name(), 'subtitle': '%s, %s' % (WD[t.weekday()], t.strftime('%d.%m.%Y · %H:%M')),
+            'cells': cells, 'footer': ('Nicht erreichbar: ' + ', '.join(errs)) if errs else 'Alle Quellen aktuell'}
+    return card, 'briefing', ' '.join(said)
+
+
+def _name():
+    try: return json.load(open(os.path.join(HOME, 'jarvis', 'config.json'))).get('name', 'Harry')
+    except Exception: return 'Harry'
+
+
+def p_system(args):
+    txt = run([os.path.join(HOME, 'jarvis', 'bin', 'jarvis-sysinfo')])
+    g = lambda pat, default=None: (re.search(pat, txt) or [None, default])[1]
+    bat, state = int(g(r'Akku: (\d+)%', 0)), g(r'Akku: \d+% \((\w+)\)', '')
+    ru, rt = int(g(r'RAM: (\d+)/', 0)), int(g(r'RAM: \d+/(\d+)', 1))
+    su, st = int(g(r'Swap: (\d+)/', 0)), int(g(r'Swap: \d+/(\d+)', 1))
+    cpu = int(g(r'CPU: (\d+)', 0))
+    tiles = [{'label': 'Akku', 'value': bat, 'unit': '%', 'gauge': bat, 'note': {'Charging': 'lädt', 'Discharging': 'entlädt', 'Full': 'voll'}.get(state, state),
+              'level': 'crit' if bat < 15 else 'warn' if bat < 30 else 'ok'},
+             {'label': 'RAM', 'value': round(ru / rt * 100), 'unit': '%', 'gauge': ru / rt * 100, 'note': '%d / %d MB' % (ru, rt), 'level': 'warn' if ru / rt > .85 else None},
+             {'label': 'Swap', 'value': su, 'unit': 'MB', 'gauge': su / max(st, 1) * 100, 'note': 'von %d MB' % st},
+             {'label': 'CPU-Temp', 'value': cpu, 'unit': '°C', 'gauge': min(100, cpu), 'level': 'crit' if cpu > 75 else 'warn' if cpu > 60 else None},
+             {'label': 'Last', 'value': g(r'Last: ([\d.]+)', '?'), 'note': 'Laufzeit ' + g(r'Uptime: (.+)', '?')},
+             {'label': 'WLAN', 'value': g(r'WLAN: .*?:(\d+)', '–'), 'unit': '%', 'note': g(r'WLAN: (.*?):\d+', 'getrennt')},
+             {'label': 'Frei /', 'value': g(r'/: ([\d.]+\w)', '?')}, {'label': 'Frei /data', 'value': g(r'/data: ([\d.]+\w)', '?')}]
+    card = {'type': 'stats', 'icon': '🖥️', 'title': 'Systemzustand', 'subtitle': 'Galaxy Tab A · postmarketOS', 'tiles': tiles}
+    return card, 'system', 'Akku %d Prozent, Speicher zu %d Prozent belegt, CPU %d Grad.' % (bat, round(ru / rt * 100), cpu)
+
+
+PRESETS = {'mail': p_mail, 'mail-search': p_mail_search, 'mail-read': p_mail_read, 'agenda': p_agenda, 'whatsapp': p_whatsapp,
+           'chat': p_chat, 'weather': p_weather, 'wetter': p_weather, 'briefing': p_briefing, 'system': p_system}
+
+
+def main(argv):
+    os.makedirs(CACHE, exist_ok=True)
+    opts = {'json': False, 'id': None, 'focus': True}
+    rest = []
+    it = iter(argv)
+    for a in it:
+        if a == '--json': opts['json'] = True
+        elif a == '--background': opts['focus'] = False
+        elif a == '--id': opts['id'] = next(it, None)
+        else: rest.append(a)
+    if not rest or rest[0] in ('-h', '--help'):
+        print(__doc__); return
+    if rest[0] == '--clear':
+        s = socket.socket(socket.AF_UNIX); s.connect(SOCK); s.sendall(b'{"cmd":"cards_clear"}\n'); s.recv(16); s.close()
+        print('Anzeige geleert.'); return
+    summary = None
+    if rest[0] == '--preset':
+        if len(rest) < 2 or rest[1] not in PRESETS: die('Preset fehlt/unbekannt. Verfügbar: ' + ', '.join(PRESETS))
+        try:
+            card, cid, summary = PRESETS[rest[1]](rest[2:])
+        except subprocess.TimeoutExpired:
+            die('Zeitüberschreitung beim Abrufen der Daten.')
+        except RuntimeError as e:
+            die('Abruf fehlgeschlagen: %s' % e)
+    elif rest[0] == '--image':
+        if len(rest) < 2: die('--image <pfad> ["Bildunterschrift"]')
+        card, cid = {'type': 'image', 'icon': '🖼️', 'title': os.path.basename(rest[1]), 'src': rest[1], 'caption': rest[2] if len(rest) > 2 else ''}, \
+            'image-%s-%d' % (re.sub(r'\W+', '-', os.path.basename(rest[1]))[:40], int(time.time() * 1000))
+    else:
+        src = sys.stdin.read() if rest[0] == '-' else open(rest[0]).read()
+        try:
+            card = json.loads(src)
+        except json.JSONDecodeError as e:
+            die('Ungültiges JSON: %s' % e)
+        cid = card.pop('id', None) if isinstance(card, dict) else None
+    try:
+        card = validate(card)
+    except ValueError as e:
+        die(str(e))
+    cid = str(opts['id'] or cid or int(time.time() * 1000))
+    if opts['json']:
+        print(json.dumps(card, ensure_ascii=False, indent=1)); return
+    try:
+        send(card, cid, opts['focus'])
+    except Exception as e:
+        die(str(e))
+    print(summary or 'Angezeigt: %s' % (card.get('title') or card['type']))
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])

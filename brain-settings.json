@@ -1,0 +1,45 @@
+{
+ "hooks": {
+  "UserPromptSubmit": [
+   {
+    "hooks": [
+     {
+      "type": "command",
+      "command": "python3 \"{JDIR}/hooks/guard.py\" prompt"
+     }
+    ]
+   }
+  ],
+  "PostToolUse": [
+   {
+    "matcher": "WebFetch|WebSearch",
+    "hooks": [
+     {
+      "type": "command",
+      "command": "python3 \"{JDIR}/hooks/guard.py\" taint"
+     }
+    ]
+   },
+   {
+    "matcher": "Bash|Read",
+    "hooks": [
+     {
+      "type": "command",
+      "command": "python3 \"{JDIR}/hooks/guard.py\" taintmsg"
+     }
+    ]
+   }
+  ],
+  "PreToolUse": [
+   {
+    "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit|Read|WebFetch",
+    "hooks": [
+     {
+      "type": "command",
+      "command": "python3 \"{JDIR}/hooks/guard.py\" pre"
+     }
+    ]
+   }
+  ]
+ }
+}

@@ -1,0 +1,10 @@
+#!/bin/sh
+# jarvis-notify "Titel" "Text"  -> Banner im Jarvis-HUD (+ Desktop-Benachrichtigung als Reserve)
+T="$1"; B="$2"
+python3 - "$T" "$B" <<'PY' 2>/dev/null || DISPLAY=${DISPLAY:-:0} notify-send -i dialog-information "$T" "$B"
+import socket, sys, os, json
+s = socket.socket(socket.AF_UNIX); s.settimeout(2)
+s.connect('/run/user/%d/jarvis.sock' % os.getuid())
+text = sys.argv[1] + (' · ' + sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else '')
+s.sendall(json.dumps({"cmd": "toast", "level": "info", "icon": "info", "text": text}).encode() + b"\n")
+PY

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Abgelöst durch jarvis-phone (findet das Handy selbst per mDNS, Kopplung per QR). Bleibt als Weiterleitung bestehen.
+case "${1:-}" in
+  pair) shift; exec jarvis-phone pair "$@" ;;
+  *) exec jarvis-phone connect ;;
+esac

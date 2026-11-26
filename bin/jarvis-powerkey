@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""jarvis-powerkey – macht die (bisher funktionslose) Power-Taste des Tablets nutzbar.
+
+Liest die Taste direkt aus /dev/input (Gerät "gpio-keys", KEY_POWER=116; Benutzer muss in Gruppe "input" sein)
+und unterscheidet:
+  kurz     -> Standard: Bildschirm aus/an
+  doppelt  -> Standard: Jarvis hört zu
+  lang     -> Standard: Ausschalt-/Abmeldedialog (ab 1,2 s halten, löst schon beim Halten aus)
+
+Aktionen anpassen in ~/jarvis/powerkey.json, z.B.:
+  {"short": "screen", "double": "listen", "long": "logout", "long_ms": 1200, "double_ms": 400}
+Erlaubte Werte: "screen", "listen", "stop", "logout", "none" oder ein beliebiger Shell-Befehl ("sh:<befehl>").
+
+Aufruf:  jarvis-powerkey            Daemon (läuft dauerhaft)
+         jarvis-powerkey --test     zeigt nur erkannte Tastendrücke an, führt nichts aus
+"""
+import json, os, select, socket, struct, subprocess, sys, time
+
+KEY_POWER = 116
+EV_KEY = 1
+FMT = 'llHHi'                      # struct input_event (64 bit)
+SIZE = struct.calcsize(FMT)
+CONF = os.path.expanduser('~/jarvis/powerkey.json')
+DEFAULTS = {'short': 'screen', 'double': 'listen', 'long': 'logout', 'long_ms': 1200, 'double_ms': 400}
+TEST = '--test' in sys.argv
+ENV = dict(os.environ, DISPLAY=os.environ.get('DISPLAY', ':0'))
+
+
+def log(*a):
+    print(time.strftime('%H:%M:%S'), *a, flush=True)
+
+
+def conf():
+    c = dict(DEFAULTS)
+    try:
+        c.update(json.load(open(CONF)))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log('powerkey.json fehlerhaft:', e)
+    return c
+
+
+def find_device():
+    """Pfad des Eingabegeräts, das KEY_POWER meldet (bevorzugt gpio-keys)."""
+    best = None
+    for block in open('/proc/bus/input/devices').read().split('\n\n'):
+        name = ev = keys = None
+        for line in block.splitlines():
+            if line.startswith('N: Name='):
+                name = line.split('=', 1)[1].strip('"')
+            elif line.startswith('H: Handlers='):
+                ev = next((h for h in line.split('=', 1)[1].split() if h.startswith('event')), None)
+            elif line.startswith('B: KEY='):
+                words = line.split('=', 1)[1].split()
+                keys = 0
+                for w in words:
+                    keys = (keys << 64) | int(w, 16)
+        if ev and keys and keys >> KEY_POWER & 1:
+            path = '/dev/input/' + ev
+            if name == 'gpio-keys':
+                return path, name
+            best = best or (path, name)
+    return best or (None, None)
+
+
+def screen_is_on():
+    out = subprocess.run(['xset', 'q'], capture_output=True, text=True, env=ENV).stdout
+    return 'Monitor is On' in out or 'Monitor is' not in out
+
+
+def jarvis(cmd):
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(2)
+        s.connect('/run/user/%d/jarvis.sock' % os.getuid())
+        s.sendall(json.dumps({'cmd': cmd}).encode() + b'\n')
+        s.recv(100)
+        s.close()
+    except Exception as e:
+        log('Jarvis nicht erreichbar:', e)
+
+
+def act(kind, c):
+    a = c.get(kind, 'none')
+    log('Taste:', kind, '->', a)
+    if TEST or a in ('none', '', None):
+        return
+    if a == 'screen':
+        if screen_is_on():
+            subprocess.run(['xset', 'dpms', 'force', 'off'], env=ENV)
+        else:
+            subprocess.run(['xset', 'dpms', 'force', 'on'], env=ENV)
+            subprocess.run(['xset', 's', 'reset'], env=ENV)
+    elif a in ('listen', 'stop'):
+        if a == 'listen':                       # Bildschirm sicher einschalten
+            subprocess.run(['xset', 'dpms', 'force', 'on'], env=ENV)
+        jarvis(a)
+    elif a == 'logout':
+        subprocess.Popen(['xfce4-session-logout'], env=ENV, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif a.startswith('sh:'):
+        subprocess.Popen(a[3:], shell=True, env=ENV, start_new_session=True)
+    else:
+        log('Unbekannte Aktion:', a)
+
+
+def run(path):
+    c = conf()
+    fd = os.open(path, os.O_RDONLY)
+    log('lausche auf', path, '| Aktionen:', {k: c[k] for k in ('short', 'double', 'long')})
+    down_at = None          # Zeitpunkt des Drückens
+    long_fired = False
+    pending_short = None    # Zeitpunkt des ersten kurzen Drucks (wartet auf evtl. Doppeldruck)
+    try:
+        while True:
+            now = time.monotonic()
+            # Timeout bis zum nächsten "Ereignis": Langdruck-Schwelle oder Ende des Doppelklick-Fensters
+            waits = []
+            if down_at is not None and not long_fired:
+                waits.append(down_at + c['long_ms'] / 1000 - now)
+            if pending_short is not None and down_at is None:
+                waits.append(pending_short + c['double_ms'] / 1000 - now)
+            timeout = max(0, min(waits)) if waits else None
+            r, _, _ = select.select([fd], [], [], timeout)
+            now = time.monotonic()
+            if not r:
+                if down_at is not None and not long_fired and now - down_at >= c['long_ms'] / 1000:
+                    long_fired = True; pending_short = None
+                    act('long', c)
+                elif pending_short is not None and down_at is None:
+                    pending_short = None
+                    act('short', c)
+                continue
+            data = os.read(fd, SIZE * 64)
+            for i in range(0, len(data) - SIZE + 1, SIZE):
+                _, _, typ, code, val = struct.unpack(FMT, data[i:i + SIZE])
+                if typ != EV_KEY or code != KEY_POWER or val == 2:   # 2 = Autorepeat
+                    continue
+                if val == 1:                                   # gedrückt
+                    c = conf()                                 # Änderungen ohne Neustart übernehmen
+                    down_at = now; long_fired = False
+                elif val == 0 and down_at is not None:         # losgelassen
+                    down_at = None
+                    if long_fired:
+                        continue
+                    if pending_short is not None:
+                        pending_short = None
+                        act('double', c)
+                    else:
+                        pending_short = now
+    finally:
+        os.close(fd)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help'):
+        print(__doc__); return
+    if not TEST:                                  # nur eine Instanz
+        import fcntl
+        lock = open('/run/user/%d/jarvis-powerkey.lock' % os.getuid(), 'w')
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print('läuft bereits'); return
+        globals()['_lock'] = lock
+    while True:
+        path, name = find_device()
+        if not path:
+            log('Keine Power-Taste gefunden, neuer Versuch in 10 s'); time.sleep(10); continue
+        try:
+            run(path)
+        except PermissionError:
+            sys.exit('Kein Zugriff auf %s – Benutzer muss in der Gruppe "input" sein.' % path)
+        except OSError as e:
+            log('Gerätefehler:', e, '– neuer Versuch in 3 s'); time.sleep(3)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

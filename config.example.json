@@ -1,0 +1,39 @@
+{
+  "name": "Tony",
+  "model": "haiku",
+  "desktop_mode": true,
+  "wake_grammar": [
+    "jarvis",
+    "hey jarvis",
+    "okay jarvis",
+    "ja",
+    "bis",
+    "was",
+    "wir",
+    "das",
+    "die",
+    "ist",
+    "hast",
+    "service",
+    "[unk]"
+  ],
+  "voice": "models/voices/de_DE-karlsson-low.onnx",
+  "speech_rate": 0.95,
+  "volume_boost": 0.9,
+  "mic_boost": 2,
+  "followup_on_question": true,
+  "location": {
+    "lat": 52.52,
+    "lon": 13.405,
+    "city": "Berlin"
+  },
+  "max_turns_per_brain": 60,
+  "tts": "edge",
+  "edge_voice": "de-DE-ConradNeural",
+  "edge_rate": "+5%",
+  "edge_pitch": "+0Hz",
+  "online_stt": "google",
+  "google_stt_key": "",
+  "wake_gate": true,
+  "software_render": false
+}

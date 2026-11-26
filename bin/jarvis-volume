@@ -1,0 +1,13 @@
+#!/bin/sh
+# jarvis-volume            -> zeigt Lautstärke
+# jarvis-volume 50|+10|-10|mute|unmute
+S=@DEFAULT_SINK@
+case "$1" in
+  "") ;;
+  mute) pactl set-sink-mute $S 1;;
+  unmute) pactl set-sink-mute $S 0;;
+  +*|-*) pactl set-sink-mute $S 0; pactl set-sink-volume $S "${1}%";;
+  *) pactl set-sink-mute $S 0; pactl set-sink-volume $S "${1}%";;
+esac
+v=$(pactl get-sink-volume $S | grep -o '[0-9]*%' | head -1); m=$(pactl get-sink-mute $S | awk '{print $2}')
+echo "Lautstärke $v (stumm: $m)"

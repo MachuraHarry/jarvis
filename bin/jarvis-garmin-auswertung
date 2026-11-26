@@ -1,0 +1,34 @@
+#!/bin/sh
+# Garmin-Auswertung: Uhr per Bluetooth synchronisieren (optional) und Puls/Stress des Tages auswerten.
+#   jarvis-garmin-auswertung            nur auswerten (neueste lokale FIT-Dateien)
+#   jarvis-garmin-auswertung --sync     vorher Uhr per BLE synchronisieren (Live-Daemon kurz aus)
+#   jarvis-garmin-auswertung --cloud    zusätzlich Connect-Cloud-Tageszusammenfassung (nur wenn über Handy synchronisiert)
+G="$HOME/jarvis/garmin"
+if [ "$1" = "--sync" ] || [ "$2" = "--sync" ]; then
+  jarvis-watch stop >/dev/null
+  timeout 240 "$G/.venv-lab/bin/python" "$G/fenix_sync.py" 2>&1 | tail -3
+  jarvis-watch start >/dev/null
+fi
+mkdir -p "$HOME/jarvis/state"
+"$G/.venv/bin/python" -I - "$G/data/fit" <<'PY'
+import sys, glob, statistics
+from fitparse import FitFile
+d = sys.argv[1]
+hr, st = [], []
+for f in sorted(glob.glob(d + "/*monitoring_b*.fit")):
+    for m in FitFile(f).get_messages():
+        v = {x.name: x.value for x in m}
+        if m.name == "monitoring" and v.get("heart_rate"):
+            hr.append(v["heart_rate"])
+        if m.name == "stress_level" and v.get("stress_level_value") is not None and v["stress_level_value"] >= 0:
+            st.append(v["stress_level_value"])
+def line(name, xs):
+    if not xs: return f"{name}: keine Daten"
+    return f"{name}: {len(xs)} Messungen, Mittel {round(statistics.mean(xs))}, min {min(xs)}, max {max(xs)}"
+print(line("Puls (bpm)", hr))
+print(line("Stress", st))
+print("Schlaf: FIT-Nachrichten nicht decodiert (Protokoll unbekannt), Cloud-Werte siehe --cloud")
+PY
+if [ "$1" = "--cloud" ] || [ "$2" = "--cloud" ] || [ "$3" = "--cloud" ]; then
+  timeout 90 "$HOME/jarvis/bin/jarvis-garmin" summary 2>&1 | head -20
+fi

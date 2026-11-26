@@ -1,0 +1,132 @@
+#!/bin/sh
+# Bildschirmaufnahme für das Galaxy Tab.
+#
+#   jarvis-record start [scharf|fluessig] [beides|ton|mikro|stumm]   (Standard: scharf beides = System-Ton + Mikrofon)
+#   jarvis-record stop
+#   jarvis-record status
+#
+#   scharf   = 1920x1200, 15 Bilder/s   fluessig = 1280x800, 20 Bilder/s
+#
+# Technik:
+#  - Bild per KMS-Grab: liest das fertige Bild direkt aus dem Grafikspeicher (ohne Umweg über den X-Server).
+#    Das Gerät hat keinen nutzbaren Hardware-Encoder -> x264 "ultrafast" auf allen Kernen.
+#  - Bild und Ton laufen in GETRENNTEN Prozessen (sonst bremst die Tonspur das Video auf die Hälfte),
+#    beide mit Uhrzeit-Zeitstempeln; beim Stoppen werden sie verlustfrei und synchron zusammengefügt.
+#  - Drehung kostet nichts: nur eine Markierung in der Datei.
+#  - Alles auf /data: Videos in ~/Videos (-> /data/home/Videos), Rohdaten in /data/home/Videos/.aufnahme
+#    Bricht eine Aufnahme ab (Absturz, Akku), werden die Rohdaten beim nächsten Aufruf fertiggestellt.
+
+RUN="/run/user/$(id -u)"
+OUTDIR="/data/home/Videos"
+WORK="$OUTDIR/.aufnahme"
+STATE="$WORK/state"
+TAG="jarvis-rec-$(id -u)"
+export DISPLAY="${DISPLAY:-:0}"
+export PULSE_SERVER="unix:$RUN/pulse/native"
+
+notify() {   # Banner im Jarvis-HUD (falls Jarvis läuft)
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import socket, sys, os, json
+s = socket.socket(socket.AF_UNIX); s.settimeout(2)
+s.connect('/run/user/%d/jarvis.sock' % os.getuid())
+s.sendall(json.dumps({"cmd": "toast", "level": sys.argv[1], "icon": "info", "text": sys.argv[2]}).encode() + b"\n")
+PY
+}
+fmt() { printf '%d:%02d' $(($1/60)) $(($1%60)); }
+ROOT="$(dirname "$0")/jarvis-root"
+video_running() { "$ROOT" kmsgrab-running 2>/dev/null; }
+
+finalize() {   # Rohdaten -> fertige MP4 (synchron, mit Dreh-Markierung)
+  [ -f "$STATE" ] || return 0
+  T0=$(sed -n 1p "$STATE"); OUT=$(sed -n 2p "$STATE"); ROT=$(sed -n 4p "$STATE")
+  V="$WORK/video.ts"; A="$WORK/ton.ts"
+  if [ ! -s "$V" ]; then rm -f "$WORK"/*.ts "$STATE"; echo "Keine Videodaten vorhanden."; return 1; fi
+  if [ -s "$A" ]; then
+    VS=$(ffprobe -v error -show_entries format=start_time -of csv=p=0 "$V")
+    AS=$(ffprobe -v error -show_entries format=start_time -of csv=p=0 "$A")
+    OFF=$(python3 -c "d=float('${AS:-0}' or 0)-float('${VS:-0}' or 0); print(round(d if abs(d)<5 else 0,3))" 2>/dev/null || echo 0)
+    nice -n 10 ffmpeg -hide_banner -loglevel error -nostdin -y -display_rotation "${ROT:-0}" -i "$V" \
+      -itsoffset "$OFF" -i "$A" -map 0:v -map 1:a -c copy -movflags +faststart "$OUT"
+  else
+    nice -n 10 ffmpeg -hide_banner -loglevel error -nostdin -y -display_rotation "${ROT:-0}" -i "$V" \
+      -map 0:v -c copy -movflags +faststart "$OUT"
+  fi
+  if [ -s "$OUT" ]; then
+    rm -f "$WORK"/*.ts "$STATE"
+    D=$(( $(date +%s) - T0 )); [ -n "$1" ] && D=$1
+    SIZE=$(du -h "$OUT" | cut -f1)
+    notify info "■ Aufnahme gespeichert: $(basename "$OUT") ($SIZE)"
+    echo "Gespeichert: $OUT ($SIZE)"
+  else
+    notify warn "Aufnahme konnte nicht gespeichert werden – Rohdaten liegen in $WORK"
+    echo "Fehler beim Zusammenfügen. Rohdaten bleiben in $WORK"; return 1
+  fi
+}
+
+case "${1:-status}" in
+start)
+  mkdir -p "$WORK"
+  if video_running; then echo "Aufnahme läuft bereits: $(sed -n 2p "$STATE")"; exit 0; fi
+  [ -f "$STATE" ] && { echo "Stelle unterbrochene Aufnahme fertig …"; finalize; }
+  Q=scharf; AUD=beides
+  for a in "$2" "$3"; do
+    case "$a" in scharf|fluessig|flüssig) Q=$a;; ton|mikro|beides|stumm) AUD=$a;; "") ;; *) echo "Unbekannte Option: $a"; exit 1;; esac
+  done
+  OUT="$OUTDIR/Bildschirm_$(date +%Y-%m-%d_%H-%M-%S).mp4"
+  case "$(xrandr 2>/dev/null | grep ' connected' | head -1 | awk '{print ($4 ~ /^\(/) ? "normal" : $4}')" in
+    right) ROT=90;; left) ROT=270;; inverted) ROT=180;; *) ROT=0;;
+  esac
+  if [ "$Q" = scharf ]; then FR=15; SCALE="scale=flags=fast_bilinear:threads=4"; CRF=24
+  else FR=20; CRF=23
+    if [ "$ROT" = 90 ] || [ "$ROT" = 270 ]; then SCALE="scale=800:1280:flags=fast_bilinear:threads=4"
+    else SCALE="scale=1280:800:flags=fast_bilinear:threads=4"; fi
+  fi
+  printf '%s\n%s\n%s %s\n%s\n' "$(date +%s)" "$OUT" "$Q" "$AUD" "$ROT" > "$STATE"
+
+  # Bild (root wegen KMS-Grab; Ausgabe über Pipe -> Datei gehört harry)
+  if [ "$Q" = scharf ]; then KM=scharf; elif [ "$ROT" = 90 ] || [ "$ROT" = 270 ]; then KM=port; else KM=land; fi
+  "$ROOT" kmsgrab $KM > "$WORK/video.ts" 2> "$WORK/video.log" &
+
+  # Ton (eigener Prozess, als harry)
+  SINK="$(pactl get-default-sink 2>/dev/null).monitor"; SRC="$(pactl get-default-source 2>/dev/null)"
+  case "$AUD" in
+    ton)    AIN="-f pulse -wallclock 1 -i $SINK"; AF="";;
+    mikro)  AIN="-f pulse -wallclock 1 -i $SRC"; AF="";;
+    beides) AIN="-f pulse -wallclock 1 -i $SINK -f pulse -wallclock 1 -i $SRC"; AF="-filter_complex amix=inputs=2:normalize=0,alimiter=limit=0.95";;
+    stumm)  AIN="";;
+  esac
+  if [ -n "$AIN" ]; then
+    # shellcheck disable=SC2086
+    ffmpeg -hide_banner -loglevel error -nostdin $AIN $AF -copyts -c:a aac -b:a 128k \
+      -metadata comment="$TAG-a" -f mpegts "$WORK/ton.ts" 2> "$WORK/ton.log" &
+    echo $! > "$WORK/ton.pid"
+  fi
+  sleep 1.5
+  if ! video_running; then
+    echo "Aufnahme konnte nicht starten:"; cat "$WORK/video.log"
+    [ -f "$WORK/ton.pid" ] && kill "$(cat "$WORK/ton.pid")" 2>/dev/null
+    rm -f "$WORK"/*.ts "$WORK/ton.pid" "$STATE"; exit 1
+  fi
+  notify info "● Aufnahme läuft ($Q, Ton: $AUD)"
+  echo "Aufnahme gestartet ($Q, Ton: $AUD) → $OUT"
+  ;;
+stop)
+  if [ ! -f "$STATE" ]; then echo "Keine Aufnahme aktiv."; exit 0; fi
+  T0=$(sed -n 1p "$STATE"); D=$(( $(date +%s) - T0 ))
+  "$ROOT" kmsgrab-stop 2>/dev/null
+  [ -f "$WORK/ton.pid" ] && kill -INT "$(cat "$WORK/ton.pid")" 2>/dev/null
+  i=0; while { video_running || { [ -f "$WORK/ton.pid" ] && kill -0 "$(cat "$WORK/ton.pid")" 2>/dev/null; }; } && [ $i -lt 50 ]; do
+    sleep 0.2; i=$((i+1)); done
+  "$ROOT" kmsgrab-stop kill 2>/dev/null; [ -f "$WORK/ton.pid" ] && kill -9 "$(cat "$WORK/ton.pid")" 2>/dev/null
+  rm -f "$WORK/ton.pid"
+  echo "Aufnahme beendet ($(fmt $D)), speichere …"
+  finalize "$D"
+  ;;
+status)
+  if [ -f "$STATE" ] && video_running; then
+    T0=$(sed -n 1p "$STATE"); echo "Aufnahme läuft seit $(fmt $(( $(date +%s) - T0 ))) ($(sed -n 3p "$STATE")) → $(sed -n 2p "$STATE")"
+  elif [ -f "$STATE" ]; then echo "Unterbrochene Aufnahme gefunden – wird beim nächsten Start/Stop fertiggestellt."
+  else echo "Keine Aufnahme aktiv."; fi
+  ;;
+*) sed -n 2,9p "$0"; exit 1;;
+esac

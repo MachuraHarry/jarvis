@@ -1,0 +1,65 @@
+#!/bin/sh
+# jarvis-restart ["Commit-Nachricht"]
+# Sicherer Neustart nach Änderungen am eigenen Code:
+#   1. Syntax-Check aller Python-Dateien + Selbsttests  -> bei Fehler KEIN Neustart (laufende Version bleibt)
+#   2. git commit
+#   3. Neustart (losgelöst, überlebt das Beenden des Gehirns)
+#   4. Wartet bis 90 s auf "Alle Systeme online". Klappt das nicht: Rollback auf Tag "good" und erneuter Start.
+#   Erfolgreicher Start -> Tag "good" wird auf den neuen Stand gesetzt.
+J="$HOME/jarvis"; cd "$J" || exit 1
+UP="/run/user/$(id -u)/jarvis-up"
+MSG="${1:-Änderung durch Jarvis}"
+
+if [ "$1" != "--watch" ]; then
+  err=$(python3 -m py_compile app/*.py hooks/guard.py garmin/*.py bin/jarvis-show bin/jarvis-research bin/jarvis-powerkey bin/jarvis-camera bin/jarvis-phone bin/jarvis-caps bin/jarvis-pentest 2>&1) \
+    || { echo "ABGEBROCHEN – Syntaxfehler, kein Neustart:"; echo "$err"; exit 1; }
+  for f in config.json config.example.json brain-settings.json; do
+    python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" 2>/dev/null || { echo "ABGEBROCHEN – $f ist kein gültiges JSON"; exit 1; }
+  done
+  if [ -f tests/selftest.py ]; then
+    out=$(python3 tests/selftest.py 2>&1) || { echo "ABGEBROCHEN – Selbsttest fehlgeschlagen, kein Neustart:"; echo "$out" | tail -20; exit 1; }
+  fi
+  git add -A >/dev/null 2>&1
+  if git diff --cached --quiet; then
+    echo "Keine Änderungen zu committen."
+  else
+    # Auto-Commits sind als "Jarvis" erkennbar; der Pre-commit-Wächter (tools/git-hooks) blockiert Privates/Secrets.
+    out=$(git -c user.name=Jarvis -c user.email=jarvis@localhost commit -qm "$MSG" 2>&1) \
+      || { echo "ABGEBROCHEN – Commit blockiert, kein Neustart:"; echo "$out"; exit 1; }
+    echo "Commit: $(git log -1 --format='%h %s')"
+  fi
+  setsid "$0" --watch "$MSG" </dev/null >>"$J/restart.log" 2>&1 &
+  echo "Neustart läuft im Hintergrund (Protokoll: ~/jarvis/restart.log). Bei Fehlstart erfolgt automatisch ein Rollback."
+  exit 0
+fi
+
+# ── losgelöster Teil ──
+log() { echo "$(date '+%F %T') $*"; }
+restart_and_wait() {
+  before=$(stat -c %Y "$UP" 2>/dev/null || echo 0)
+  pkill -TERM -f 'python3 app/jarvis.py'
+  # run.sh startet nach 3 s neu. Läuft run.sh nicht (z.B. manuell beendet), selbst starten.
+  sleep 6
+  pgrep -f 'jarvis/run.sh' >/dev/null || { log "run.sh lief nicht – starte es"; DISPLAY=:0 setsid "$J/run.sh" >/dev/null 2>&1 & }
+  i=0
+  while [ $i -lt 90 ]; do
+    now=$(stat -c %Y "$UP" 2>/dev/null || echo 0)
+    [ "$now" -gt "$before" ] && return 0
+    sleep 1; i=$((i+1))
+  done
+  return 1
+}
+
+log "Neustart: $(git log -1 --format='%h %s')"
+if restart_and_wait; then
+  git tag -f good >/dev/null 2>&1
+  log "OK – Tag good -> $(git rev-parse --short HEAD)"
+  exit 0
+fi
+bad=$(git rev-parse --short HEAD)
+log "FEHLSTART bei $bad – Rollback auf good ($(git rev-parse --short good))"
+git checkout good -- app hooks bin run.sh 2>&1
+git -c user.name=Jarvis -c user.email=jarvis@localhost commit -qam "Rollback nach Fehlstart von $bad" >/dev/null 2>&1
+mkdir -p "$J/state"
+echo "Der Neustart nach der Änderung „$2“ ist fehlgeschlagen. Ich bin auf den letzten funktionierenden Stand zurückgegangen (Commit $bad ist kaputt)." > "$J/state/rollback-notice"
+if restart_and_wait; then log "Rollback-Start OK"; else log "AUCH ROLLBACK STARTET NICHT – manuell prüfen (stdout.log)"; fi

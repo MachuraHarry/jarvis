@@ -1,0 +1,32 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Syntax
+        run: |
+          python -m py_compile app/*.py hooks/guard.py garmin/*.py tools/*.py
+          for f in bin/*; do head -1 "$f" | grep -q python && python -m py_compile "$f" || true; done
+      - name: Selbsttest (Wächter, Sprache, Chronik, lokale Befehle)
+        run: python tests/selftest.py
+      - name: Shell-Skripte
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y shellcheck >/dev/null
+          shellcheck -S error run.sh tools/fetch-models.sh $(grep -l '^#!/bin/sh' bin/*)
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

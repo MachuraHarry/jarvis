@@ -1,0 +1,19 @@
+#!/bin/sh
+# jarvis-watch – Live-Daten der Garmin fenix 5 Plus per Bluetooth -> HUD
+#   jarvis-watch            Daemon im Vordergrund (nur eine Instanz)
+#   jarvis-watch start      im Hintergrund starten + Autostart wieder an
+#   jarvis-watch stop       beenden + Autostart aus (Uhr frei fürs Handy), bis "start"
+#   jarvis-watch status     aktueller Stand (JSON)
+# Jarvis startet den Daemon automatisch (beim Start und wenn er abstürzt), außer nach "stop".
+D="$HOME/jarvis/garmin"
+R="/run/user/$(id -u)"
+OFF="$HOME/jarvis/state/watch-off"
+case "$1" in
+  status) cat "$R/jarvis-watch.json" 2>/dev/null || echo '{"connected": false}'; echo; exit 0 ;;
+  stop)   mkdir -p "$(dirname "$OFF")"; touch "$OFF"
+          pkill -f "$D/garmin_live[.]py" && echo "gestoppt (Autostart aus bis: jarvis-watch start)" || echo "läuft nicht (Autostart aus)"; exit 0 ;;
+  start)  rm -f "$OFF"; setsid "$0" >> "$HOME/jarvis/watch.log" 2>&1 < /dev/null & echo gestartet; exit 0 ;;
+esac
+exec 8>"$R/jarvis-watch.lock"
+flock -n 8 || { echo "läuft bereits"; exit 0; }
+exec "$D/.venv-lab/bin/python" "$D/garmin_live.py"

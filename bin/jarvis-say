@@ -1,0 +1,10 @@
+#!/bin/sh
+# jarvis-say "Text" -> Jarvis spricht den Text laut (über das laufende HUD)
+python3 - "$*" <<'PY'
+import socket,sys,json
+s=socket.socket(socket.AF_UNIX); 
+try:
+    s.connect('/run/user/%d/jarvis.sock'%__import__('os').getuid()); s.sendall(json.dumps({"cmd":"say","text":sys.argv[1]}).encode()+b"\n"); print("ok")
+except Exception as e:
+    import subprocess; subprocess.run(['espeak-ng','-v','de',sys.argv[1]])
+PY

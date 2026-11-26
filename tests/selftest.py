@@ -130,6 +130,22 @@ for f in ('config.example.json', 'brain-settings.json') + (('config.json',) if o
         FAILS.append('json %s: %s' % (f, e))
 check('persona', os.path.getsize(os.path.join(J, 'persona.md')) > 2000)
 
+# ── Gehirn-Backends ──
+bb = load(os.path.join(J, 'app', 'brain_backend.py'), 'brain_backend')
+check('backend.claude.default', bb.normalize(None, 'haiku') == ('claude', 'haiku'))
+check('backend.opencode.model', bb.normalize('opencode', 'opencode/big-pickle') == ('opencode', 'opencode/big-pickle'))
+check('backend.unbekannt', bb.normalize('nonsense', 'x')[0] == 'claude')
+check('backend.label', bb.label('claude', 'haiku') == 'HAIKU' and bb.label('opencode', 'opencode/big-pickle') == 'BIG')
+check('backend.quota', bb.quota_error('Free usage limit reached') and bb.quota_error('provider.free-limit') and not bb.quota_error('Alles gut'))
+check('backend.event.error', bb.parse_event({'type': 'error', 'error': {'type': 'provider.free-limit',
+                                                                       'message': 'Free usage limit reached'}})['text'] == 'Free usage limit reached')
+check('backend.event.text', bb.parse_event({'type': 'text', 'part': {'text': 'Hallo'}})['text'] == 'Hallo')
+ev = bb.parse_event({'type': 'tool_use', 'part': {'id': 't1', 'tool': 'shell',
+                                                  'state': {'status': 'completed', 'input': {'command': 'ls'}, 'output': 'x'}}})
+check('backend.event.tool', ev['kind'] == 'tool' and ev['name'] == 'shell' and ev['output'] == 'x' and not ev['error'])
+check('backend.event.none', bb.parse_event({'type': 'step_finish'})['kind'] == 'none')
+check('backend.agent', 'Du bist' in bb.agent_file_text('Du bist Jarvis.') or 'Jarvis' in bb.agent_file_text('Du bist Jarvis.'))
+
 if FAILS:
     print('SELBSTTEST FEHLGESCHLAGEN (%d):' % len(FAILS))
     for f in FAILS:

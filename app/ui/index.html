@@ -21,6 +21,7 @@
   <nav id="bar">
     <div class="chips-left">
       <button class="chip" id="c-brain" title="KI-Verbindung"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4M5 5l2.5 2.5M16.5 16.5L19 19M5 19l2.5-2.5M16.5 7.5L19 5"/></svg><span>KI</span></button>
+      <button class="chip" id="c-model" title="Gehirn / Modell wechseln"><svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 1v4M15 1v4M9 19v4M15 19v4M1 9h4M1 15h4M19 9h4M19 15h4"/></svg><span>MODELL</span></button>
       <button class="chip on" id="c-mic" title="Mikrofon an/aus"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg><span>MIKRO</span></button>
       <button class="chip rec" id="c-rec" title="Aufnahme stoppen" hidden><i class="dot"></i><span>REC 0:00</span></button>
       <button class="chip" id="c-watch" title="Garmin fenix 5 Plus" hidden><svg viewBox="0 0 24 24" class="heart"><path d="M12 20s-7-4.4-7-10a4 4 0 017-2.6A4 4 0 0119 10c0 5.6-7 10-7 10z"/></svg><span>--</span></button>
@@ -139,6 +140,12 @@
     </form>
   </footer>
 </main>
+
+<!-- Gehirn-Auswahl -->
+<div id="modelmenu" class="modelmenu panel" hidden>
+  <div class="mm-title">GEHIRN WÄHLEN</div>
+  <div id="modelopts"></div>
+</div>
 
 <!-- Hinweise / Warnungen -->
 <div id="toasts"></div>

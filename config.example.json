@@ -1,5 +1,6 @@
 {
   "name": "Tony",
+  "backend": "claude",
   "model": "haiku",
   "desktop_mode": true,
   "wake_grammar": [

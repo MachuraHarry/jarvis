@@ -4,11 +4,12 @@ J.A.R.V.I.S. – Sprachassistent für ein Linux-Tablet (postmarketOS, Galaxy Tab
 
 Ohren  : Vosk (offline, deutsch) mit Weckwort "Jarvis"
 Stimme : Piper-Stimme "Thorsten" via onnxruntime + espeak-ng Phoneme
-Gehirn : dauerhaft laufender `claude -p` Prozess (stream-json) mit Systemzugriff
+Gehirn : `claude -p` (stream-json) oder `opencode run`, umschaltbar im HUD
 Gesicht: WebKitGTK-HUD, das als Desktop-Hintergrund läuft
 """
 import time; T0 = time.time()
-import os, sys, json, threading, queue, subprocess, re, socket, datetime, urllib.request, urllib.parse, signal, traceback
+import os, sys, json, threading, queue, subprocess, re, shutil, socket, datetime, urllib.request, urllib.parse, signal, traceback
+import brain_backend as bb
 
 HOME = os.path.expanduser('~')
 APP = os.path.dirname(os.path.abspath(__file__))
@@ -20,6 +21,7 @@ LOG_PATH = os.path.join(JDIR, 'jarvis.log')
 
 DEFAULTS = {
     "name": "Harry",
+    "backend": "claude",            # claude = mit Wächter, opencode = z.B. Big Pickle (frei)
     "model": "haiku",               # haiku = schnell, sonnet/opus = klüger aber langsamer
     "desktop_mode": True,           # HUD ersetzt den XFCE-Desktop
     "fullscreen": True,             # Panel automatisch ausblenden -> HUD nutzt den ganzen Bildschirm
@@ -75,6 +77,7 @@ def brain_settings_path():
     return out
 
 CFG = load_config()
+CFG['backend'], CFG['model'] = bb.normalize(CFG.get('backend'), CFG.get('model'))
 if not os.path.exists(CONF_PATH):
     save_config(CFG)
 # relative Pfade in der Config beziehen sich auf das Jarvis-Verzeichnis
@@ -421,6 +424,27 @@ class Voice:
 
 # ───────────────────────────── Gehirn ─────────────────────────────
 
+def brain_env():
+    """Umgebung für beide Backends: Jarvis-Werkzeuge zuerst, große Caches auf /data."""
+    env = dict(os.environ)
+    env['PATH'] = os.path.join(JDIR, 'bin') + ':' + os.path.join(HOME, '.local/bin') + ':' + env.get('PATH', '/usr/bin:/bin')
+    env['DISPLAY'] = env.get('DISPLAY', ':0')
+    # Alles Große auf /data: temporäre Dateien, Caches und Werkzeug-Installationen
+    D = '/data/home'
+    for k, v in {'TMPDIR': D + '/tmp', 'XDG_CACHE_HOME': D + '/.cache', 'PIP_CACHE_DIR': D + '/.cache/pip',
+                 'PYTHONUSERBASE': D + '/.local', 'GOPATH': D + '/go', 'GOCACHE': D + '/.cache/go-build',
+                 'GOMODCACHE': D + '/go/pkg/mod', 'npm_config_prefix': D + '/.npm-global',
+                 'npm_config_cache': D + '/.cache/npm', 'CARGO_HOME': D + '/.cargo', 'RUSTUP_HOME': D + '/.rustup',
+                 'HF_HOME': D + '/.cache/huggingface'}.items():
+        env[k] = v
+    os.makedirs(D + '/tmp', exist_ok=True); os.makedirs(D + '/opt', exist_ok=True)
+    env['PATH'] = D + '/opt/bin:' + D + '/.npm-global/bin:' + D + '/go/bin:' + env['PATH']
+    for k in list(env):
+        if k.startswith('CLAUDE_CODE_') or k in ('CLAUDECODE', 'CLAUDE_PID', 'AI_AGENT'):
+            env.pop(k)
+    return env
+
+
 class Brain:
     TOOLS = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebSearch', 'WebFetch']
 
@@ -442,7 +466,7 @@ class Brain:
         except Exception:
             return ''
 
-    def _spawn(self):
+    def _persona(self):
         persona = open(os.path.join(JDIR, 'persona.md')).read().replace('Harry', CFG['name'])
         persona += '\n\n' + self.self_knowledge()
         try:
@@ -452,22 +476,11 @@ class Brain:
                 log('brain: Chronik geladen (%d Zeichen)' % len(primer))
         except Exception as e:
             log('brain: Chronik-Fehler', e)
-        env = dict(os.environ)
-        env['PATH'] = os.path.join(JDIR, 'bin') + ':' + os.path.join(HOME, '.local/bin') + ':' + env.get('PATH', '/usr/bin:/bin')
-        env['DISPLAY'] = env.get('DISPLAY', ':0')
-        # Alles Große auf /data: temporäre Dateien, Caches und Werkzeug-Installationen
-        D = '/data/home'
-        for k, v in {'TMPDIR': D + '/tmp', 'XDG_CACHE_HOME': D + '/.cache', 'PIP_CACHE_DIR': D + '/.cache/pip',
-                     'PYTHONUSERBASE': D + '/.local', 'GOPATH': D + '/go', 'GOCACHE': D + '/.cache/go-build',
-                     'GOMODCACHE': D + '/go/pkg/mod', 'npm_config_prefix': D + '/.npm-global',
-                     'npm_config_cache': D + '/.cache/npm', 'CARGO_HOME': D + '/.cargo', 'RUSTUP_HOME': D + '/.rustup',
-                     'HF_HOME': D + '/.cache/huggingface'}.items():
-            env[k] = v
-        os.makedirs(D + '/tmp', exist_ok=True); os.makedirs(D + '/opt', exist_ok=True)
-        env['PATH'] = D + '/opt/bin:' + D + '/.npm-global/bin:' + D + '/go/bin:' + env['PATH']
-        for k in list(env):
-            if k.startswith('CLAUDE_CODE_') or k in ('CLAUDECODE', 'CLAUDE_PID', 'AI_AGENT'):
-                env.pop(k)
+        return persona
+
+    def _spawn(self):
+        persona = self._persona()
+        env = brain_env()
         cmd = ['claude', '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
                '--include-partial-messages', '--no-session-persistence', '--model', CFG['model'],
                '--append-system-prompt', persona, '--permission-mode', 'bypassPermissions',
@@ -639,6 +652,164 @@ class Brain:
                 if e.get('is_error') and gen == self.cancel_gen:
                     err = 'Fehler: ' + str(e.get('result') or e.get('subtype'))[:200]
                 return ('done', ''.join(full) if gen == self.cancel_gen else None, err)
+
+
+class OpenCodeBrain(Brain):
+    """Gehirn via `opencode run --format json` (z. B. Big Pickle, kostenlos).
+
+    Der Kontext bleibt über eine feste Session-ID erhalten; die Persona wird als
+    generierte Agent-Datei eingehängt. Bei erschöpftem Free-Kontingent übernimmt
+    automatisch wieder Claude (siehe ask()).
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+        self.owner = None
+        self._alive = False
+        self._proc = None
+
+    def _spawn(self):
+        wd = os.path.join(JDIR, 'workspace')
+        os.makedirs(os.path.join(wd, '.opencode', 'agents'), exist_ok=True)
+        agent = os.path.join(wd, '.opencode', 'agents', 'jarvis.md')
+        with open(agent, 'w') as f:
+            f.write(bb.agent_file_text(self._persona()))
+        os.chmod(agent, 0o600)
+        # OpenCode verlangt Session-IDs mit Präfix `ses`
+        self.session_id = 'ses_jarvis%d' % int(time.time())
+        self.started = time.time()
+        self.turns = 0
+        self._alive = True
+        log('brain: OpenCode gestartet', self.model)
+
+    def alive(self):
+        return self._alive
+
+    def restart(self):
+        self._alive = False
+        if self._proc and self._proc.poll() is None:
+            try: self._proc.terminate()
+            except Exception: pass
+        self._proc = None
+
+    def interrupt(self):
+        self.cancel_gen += 1
+        if self._proc and self._proc.poll() is None:
+            try: self._proc.terminate()
+            except Exception: pass
+
+    def ask(self, text, on_delta, on_tool, on_done, on_result=None):
+        with self.lock:
+            status, full, err = self._ask_once(text, on_delta, on_tool, on_result)
+        if status != 'fallback':
+            on_done(full, err)
+            return
+        log('brain: OpenCode-Kontingent erschöpft – Claude übernimmt diese Runde')
+        CFG['backend'], CFG['model'] = bb.normalize('claude', 'haiku')
+        save_config(CFG)
+        ui.send('model', backend=CFG['backend'], model=CFG['model'], label=bb.label(CFG['backend'], CFG['model']))
+        ui.send('toast', level='warn', icon='info',
+                text='OpenCode-Kontingent aufgebraucht – Claude übernimmt')
+        if self.owner:
+            self.owner.brain = Brain()
+            self.owner.brain.owner = self.owner
+            self.owner.brain.started = time.time()
+            self.owner.brain.ask(text, on_delta, on_tool, on_done, on_result)
+        else:
+            on_done(full, 'OpenCode-Kontingent aufgebraucht und kein Fallback verfügbar.')
+
+    def _ask_once(self, text, on_delta, on_tool, on_result):
+        """-> ('done'|'fallback', full|None, err|None)"""
+        if self.turns >= CFG['max_turns_per_brain']:
+            log('brain: frischer Kontext nach %d Runden' % self.turns)
+            self.restart()
+        if not self.alive():
+            self._spawn()
+        self.turns += 1
+        self.last_used = time.time()
+        gen = self.cancel_gen
+        full, open_tools = [], set()
+        acted, quota = False, False
+
+        opencode = shutil.which('opencode')
+        if not opencode:
+            return ('fallback', None, 'opencode nicht im PATH')
+        cmd = [opencode, 'run', '--format', 'json', '--auto', '--session', self.session_id,
+               '--agent', 'jarvis', '--model', self.model, str(text)[:2000]]
+        bl = os.path.join(JDIR, 'brain.log')
+        try:
+            if os.path.getsize(bl) > 1_000_000: os.replace(bl, bl + '.old')
+        except OSError: pass
+        errf = open(bl, 'a')
+        errf.write('\n=== %s OpenCode start (%s) ===\n' % (time.strftime('%F %T'), self.model)); errf.flush()
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errf,
+                                 text=True, bufsize=1, cwd=os.path.join(JDIR, 'workspace'), env=brain_env())
+        except Exception as e:
+            errf.close()
+            log('brain: OpenCode start fehlgeschlagen', e)
+            return ('fallback', None, str(e))
+        self._proc = p
+        q = queue.Queue()
+
+        def reader():
+            for line in p.stdout:
+                try: q.put(json.loads(line))
+                except Exception: pass
+            q.put({'_dead': True, 'rc': p.returncode})
+        threading.Thread(target=reader, daemon=True).start()
+
+        t_start = last_ev = time.time()
+        while True:
+            try:
+                e = q.get(timeout=5)
+            except queue.Empty:
+                now = time.time()
+                if gen != self.cancel_gen and now - last_ev > 60:
+                    self.restart(); return ('done', None, None)
+                limit = self.TOOL_TIMEOUT if open_tools else self.IDLE_TIMEOUT
+                if now - last_ev > limit or now - t_start > self.HARD_TIMEOUT:
+                    log('brain: OpenCode-Timeout (%.0fs still)' % (now - last_ev))
+                    self.restart()
+                    return ('done', ''.join(full), 'Zeitüberschreitung – das Gehirn hat nicht reagiert.')
+                continue
+            last_ev = time.time()
+            if e.get('_dead'):
+                self._proc = None
+                errf.close()
+                if quota or bb.quota_error(''.join(full) + self.stderr_tail()):
+                    return ('fallback', None, None)
+                if not acted and gen == self.cancel_gen:
+                    return ('fallback', None, None)
+                return ('done', ''.join(full) if gen == self.cancel_gen else None, None)
+            info = bb.parse_event(e)
+            kind = info.get('kind')
+            if kind == 'delta':
+                d = info['text']
+                full.append(d); acted = True
+                if gen == self.cancel_gen: on_delta(d)
+            elif kind == 'tool':
+                acted = True
+                if gen == self.cancel_gen:
+                    tid = info['id']
+                    open_tools.add(tid)
+                    on_tool(info['name'], info['input'], tid)
+                    if on_result:
+                        on_result(tid, info['error'], str(info['output'] or '')[:2000])
+                    open_tools.discard(tid)
+            elif kind == 'error':
+                text_err = info['text']
+                log('brain: OpenCode-Fehler', text_err[:200])
+                if bb.quota_error(text_err):
+                    quota = True
+                    return ('fallback', None, None)
+
+
+def make_brain():
+    """Backends-Fabrik; Modell/Backend kommen aus config.json."""
+    backend, model = bb.normalize(CFG.get('backend'), CFG.get('model'))
+    return OpenCodeBrain(model) if backend == 'opencode' else Brain()
 
 
 # ───────────────────────────── Ohren ─────────────────────────────
@@ -1156,7 +1327,8 @@ class Jarvis:
     def __init__(self):
         self.voice = Voice()
         self.voice.on_idle = on_main(self.on_voice_idle)
-        self.brain = Brain()
+        self.brain = make_brain()
+        self.brain.owner = self
         self.tele = Telemetry()
         self.voice.online = lambda: self.tele.online
         self.tele.event = self.on_event
@@ -1287,6 +1459,8 @@ class Jarvis:
                 if self.ears.model: break
                 time.sleep(0.5)
             play_sound('boot')
+            ui.send('models', backends=bb.BACKENDS)
+            ui.send('model', backend=CFG['backend'], model=CFG['model'], label=bb.label(CFG['backend'], CFG['model']))
             ui.send('boot', step='done', text='Alle Systeme online')
             ui.booted = True
             log('⏱ Alle Systeme online nach %.1fs' % (time.time() - T0))
@@ -1478,7 +1652,11 @@ class Jarvis:
 
     TOOL_KIND = {'Bash': ('run', 'Führt aus'), 'WebSearch': ('search', 'Websuche'), 'WebFetch': ('web', 'Liest Webseite'),
                  'Read': ('read', 'Liest Datei'), 'Glob': ('read', 'Sucht Dateien'), 'Grep': ('read', 'Durchsucht Dateien'),
-                 'Write': ('write', 'Schreibt Datei'), 'Edit': ('write', 'Bearbeitet Datei'), 'ToolSearch': ('think', 'Lädt Werkzeug')}
+                 'Write': ('write', 'Schreibt Datei'), 'Edit': ('write', 'Bearbeitet Datei'), 'ToolSearch': ('think', 'Lädt Werkzeug'),
+                 # OpenCode benutzt kleingeschriebene Werkzeugnamen
+                 'shell': ('run', 'Führt aus'), 'websearch': ('search', 'Websuche'), 'webfetch': ('web', 'Liest Webseite'),
+                 'read': ('read', 'Liest Datei'), 'glob': ('read', 'Sucht Dateien'), 'grep': ('read', 'Durchsucht Dateien'),
+                 'write': ('write', 'Schreibt Datei'), 'edit': ('write', 'Bearbeitet Datei')}
 
     def on_tool(self, name, inp, tid=None):
         detail = inp.get('command') or inp.get('query') or inp.get('url') or inp.get('file_path') or inp.get('pattern') or ''
@@ -1594,6 +1772,24 @@ class Jarvis:
             if self.ears:
                 self.ears.enabled = bool(m.get('on'))
                 ui.send('micstate', on=self.ears.enabled)
+        elif c == 'set_model':
+            backend, model = bb.normalize(m.get('backend'), m.get('model'))
+            if self.thinking:
+                ui.send('toast', level='warn', icon='info', text='Modellwechsel erst nach der Antwort möglich')
+                return
+            if (backend, model) == (CFG['backend'], CFG['model']):
+                ui.send('toast', level='info', icon='brain', text=bb.label(backend, model) + ' ist bereits aktiv')
+                return
+            CFG['backend'], CFG['model'] = backend, model
+            save_config(CFG)
+            self.brain.restart()
+            self.brain = make_brain()
+            self.brain.owner = self
+            ui.send('model', backend=backend, model=model, label=bb.label(backend, model))
+            ui.send('toast', level='ok', icon='brain',
+                    text='Gehirn: %s – %s' % (bb.BACKENDS[backend]['label'], bb.BACKENDS[backend]['models'][model]))
+            CHRONIK.event('Harry hat das Gehirn auf %s / %s umgestellt.' % (backend, model))
+            log('brain: Modellwechsel', backend, model)
         elif c == 'briefing':
             # Holo-Dashboard (Wetter, Termine, Mails, WhatsApp) anzeigen und Kurzfassung direkt vorlesen – ohne KI-Umweg
             self.activity('run', 'Briefing', 'sammle Wetter, Termine, Mails, WhatsApp')
@@ -1669,7 +1865,8 @@ def health():
     return {
         'uptime_s': int(time.time() - T0), 'state': jarvis.state, 'thinking': jarvis.thinking,
         'brain_alive': b.alive(), 'brain_age_s': int(time.time() - b.started) if b.alive() and b.started else 0,
-        'brain_turns': b.turns, 'brain_max_turns': CFG['max_turns_per_brain'], 'model': CFG['model'],
+        'brain_turns': b.turns, 'brain_max_turns': CFG['max_turns_per_brain'],
+        'backend': CFG['backend'], 'model': CFG['model'],
         'ears': bool(jarvis.ears and jarvis.ears.model), 'ears_mode': jarvis.ears.mode if jarvis.ears else None,
         'mic_on': bool(jarvis.ears and jarvis.ears.enabled), 'online': jarvis.tele.online,
         'tts': CFG['tts'], 'edge_down': time.time() < jarvis.voice.edge_down_until,

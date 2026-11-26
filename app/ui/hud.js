@@ -425,8 +425,33 @@ function drawHr() {
 }
 
 /* ───── Nachrichten von Python ───── */
+/* ───── Gehirn / Modell wechseln ───── */
+let modelCatalog = {}, curBackend = '', curModel = '', modelMenuOpen = false;
+function closeModelMenu() { modelMenuOpen = false; $('#modelmenu').hidden = true; }
+function renderModelMenu() {
+  const box = $('#modelopts'); box.textContent = '';
+  if (!Object.keys(modelCatalog).length) { box.appendChild(el('div', 'mm-head', 'Modelle werden geladen …')); return; }
+  for (const [bid, b] of Object.entries(modelCatalog)) {
+    box.appendChild(el('div', 'mm-head', b.label || bid));
+    for (const [mid, lbl] of Object.entries(b.models || {})) {
+      const btn = el('button', 'mm-opt' + (bid === curBackend && mid === curModel ? ' active' : ''), lbl);
+      btn.addEventListener('click', () => { closeModelMenu(); post({ cmd: 'set_model', backend: bid, model: mid }); });
+      box.appendChild(btn);
+    }
+  }
+}
+function openModelMenu() {
+  modelMenuOpen = true; $('#modelmenu').hidden = false; renderModelMenu(); post({ cmd: 'kbd_show' });
+}
+$('#c-model').addEventListener('click', e => { e.stopPropagation(); modelMenuOpen ? closeModelMenu() : openModelMenu(); });
+$('#modelmenu').addEventListener('click', e => e.stopPropagation());
+document.addEventListener('click', () => { if (modelMenuOpen) closeModelMenu(); });
+
 const H = {
   stats, weather, watch,
+  model: m => { curBackend = m.backend; curModel = m.model;
+    setTxt($('#c-model').querySelector('span'), m.label || String(m.model || 'MODELL').split('/').pop().toUpperCase()); },
+  models: m => { modelCatalog = m.backends || {}; if (modelMenuOpen) renderModelMenu(); },
   state: m => setState(m.s),
   level: m => pushLevel(m.v),
   mic: m => { if (state === 'listening') pushLevel(m.v * .9); },

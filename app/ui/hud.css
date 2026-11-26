@@ -101,6 +101,20 @@ h2::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg
 .bars i { width: 5px; background: rgba(56,232,255,.18); }
 .bars i:nth-child(1) { height: 25%; } .bars i:nth-child(2) { height: 50%; } .bars i:nth-child(3) { height: 75%; } .bars i:nth-child(4) { height: 100%; }
 .bars i.on { background: var(--cyan); }
+#c-model { padding: 0 11px; } #c-model span { font: 600 14px Mono, monospace; letter-spacing: .12em; }
+
+/* Gehirn-Auswahl (Chip in der Statusleiste) */
+.modelmenu { position: fixed; z-index: 45; top: calc(var(--top) + 54px); left: calc(var(--left) + var(--gap));
+  width: min(430px, calc(100vw - var(--left) - var(--right) - 2 * var(--gap))); padding: 14px;
+  display: flex; flex-direction: column; gap: 6px; }
+.modelmenu[hidden] { display: none; }
+.mm-title { font: 600 12px Orbitron; letter-spacing: .3em; color: var(--cyan); }
+.mm-head { font: 600 13px Rajdhani; letter-spacing: .16em; color: var(--dim); margin-top: 8px;
+  border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+.mm-opt { text-align: left; padding: 10px 12px; border: 1px solid var(--line); background: rgba(56,232,255,.05);
+  color: var(--ink); font: 600 17px Rajdhani; cursor: pointer; }
+.mm-opt:hover, .mm-opt:focus { background: rgba(56,232,255,.18); outline: none; }
+.mm-opt.active { border-color: var(--green); color: var(--green); background: rgba(93,255,176,.08); }
 
 .chip.rec { border-color: var(--red); color: var(--red); background: rgba(60,6,12,.75); }
 .chip.rec .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--red); box-shadow: 0 0 8px var(--red); flex-shrink: 0; }

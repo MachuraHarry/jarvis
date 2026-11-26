@@ -6,14 +6,17 @@ Idee: Webinhalte (WebFetch/WebSearch) können versteckte Anweisungen enthalten (
 Sobald im laufenden Gespräch Webinhalte gelesen wurden, gilt das Gespräch als "tainted".
 Dann werden nur Nachrichtenversand und curl|sh blockiert, bis Harry in seiner NÄCHSTEN Nachricht zustimmt.
 Unabhängig davon werden echte Zerstörer (rm -rf /, rm *, mkfs, dd auf Geräte …) IMMER gestoppt.
-Die Zustimmung gilt nur für diese eine Runde.
+Die Zustimmung gilt nur für diese eine Runde, aber für die ganze Aktionsklasse: Jarvis darf den
+Befehl danach leicht umformulieren (z.B. `| head -1` statt `| head -2`), ohne erneut fragen zu müssen.
 
 Zusätzlich (immer aktiv): SPEICHERSCHUTZ für die kleine Systempartition (/, ~2,6 GB).
 Nur apk-Installationen, die den freien Platz unter die Reserve drücken würden, werden blockiert.
 
 Härtung:
 - FAIL-CLOSED: wirft der Wächter selbst einen Fehler, wird das Werkzeug blockiert (Exit 2), nicht durchgelassen.
-- FREIGABE GEBUNDEN: Harrys Ja gibt nur die zuletzt blockierten Aktionen frei (exakt dieser Befehl/Pfad), einmalig.
+- FREIGABE GEBUNDEN: Harrys Ja gibt die zuletzt blockierten Aktionen frei – pro Aktionsklasse
+  (git push, Senden an denselben Empfänger, Upload, Pfad), einmalig pro Runde. Bei Zerstörern bleibt
+  die Freigabe bewusst an den exakten Befehl gebunden.
 - TAINT zusätzlich: Datenabfluss (curl -d/-F/-T, nc, scp, rsync/ssh nach außen, lange Query-URLs per WebFetch),
   Zugriff auf Zugangsdaten (~/.ssh, Tokens, Credentials) und Persistenz (Shell-Profile, Autostart, cron, /etc).
 - WÄCHTER-SCHUTZ (immer): Änderungen an guard.py, brain-settings.json, Git-Hooks, system/ brauchen Harrys Ja.
@@ -26,7 +29,8 @@ import json, os, re, sys, time
 
 STATE = '/run/user/%d/jarvis-guard.json' % os.getuid()
 HOME = os.path.expanduser('~')
-TAINT_TTL = 45 * 60
+TAINT_TTL = 15 * 60
+GRANT_TTL = 10 * 60      # Harrys Ja gilt für die laufende Runde, auch bei leicht geändertem Befehl
 ROOT_RESERVE_MB = 250    # so viel muss auf / mindestens frei bleiben (sonst bricht das System)
 
 # KRITISCH: wird IMMER blockiert (auch ohne Webinhalte), bis Harry in seiner nächsten Nachricht Ja sagt.
@@ -48,8 +52,15 @@ TAINT_DANGER = re.compile(r'''(?x)
     (curl|wget)[^|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b
   | \b(wacli\s+(\S+\s+)*(send|revoke|delete|forward|edit)|tg\s+(send|file)|gog\s+(\S+\s+)*(send|reply|reply-all|forward|fwd|trash|delete|share|autoreply)|himalaya\s+(\S+\s+)*(send|reply|forward))\b
 ''')
-# Befehle, die fremde Nachrichten-/Mailinhalte in den Kontext holen
-MSG_READ = re.compile(r'\b(wacli|tg|tdl|gog|himalaya|instaloader)\b|jarvis-show\s+(\S+\s+)*--preset\s+(mail|chat|whatsapp|briefing)')
+# Befehle, die wirklich fremde Nachrichten-/Mailinhalte in den Kontext holen.
+# Senden/Sync allein soll nicht already tainted.setzen und vor allem keine Freigaben wegwischen.
+MSG_READ = re.compile(r'''(?x)
+    \b( wacli\s+(sync|chats?|messages?|msg|read|show|history|search)
+      | tg\s+(get|read|messages?|chat|dialogs)
+      | gog\s+(message|thread|read|list)
+      | himalaya\s+(message|show|read|list)
+      | jarvis-show\s+(\S+\s+)*--preset\s+(mail|chat|whatsapp|briefing) )\b
+''', re.I)
 # Nur bei Taint: Daten nach außen schicken
 EXFIL = re.compile(r"""(?x)
     \b(curl|wget)\b[^;&|]*\s(-d|--data\S*|-F|--form\S*|-T|--upload-file|--post-file|--post-data|--body-file|-X\s*(POST|PUT))\b
@@ -69,11 +80,11 @@ SECRETS = re.compile(r"""(?x)
   | /etc/(shadow|gshadow|doas\.conf|sudoers)
   | \bid_(rsa|ed25519|ecdsa)\b
 """)
-# Persistenz/Autostart (bei Taint nicht schreiben)
+# Persistenz/Autostart (bei Taint nicht schreiben). Nicht jede Erwähnung von ~/jarvis/bin
+# ist eine Änderung – `ls ~/jarvis/bin 2>/dev/null` war ein falscher Alarm.
 PERSIST = re.compile(r"""(?x)
     (~|\$HOME|/home/\w+|/data/home)/\.(bashrc|profile|ashrc|zshrc|xprofile|xinitrc|config/autostart|ssh/authorized_keys)
   | ^/etc/ | \bcrontab\b\s+(-\S*\s+)*[^-l\s] | \bcrontab\s+-e
-  | (^|/)jarvis/(bin/|run\.sh|hooks/)
 """)
 # Wächter-Manipulation (immer, auch ohne Taint)
 GUARD_FILES = re.compile(r'(hooks/guard\.py|brain-settings\.json|\.claude/settings[\w.]*\.json|tools/git-hooks/|jarvis/system/|^system/|/etc/doas)')
@@ -140,9 +151,64 @@ def storage_check(cmd):
         return 'SPEICHERSCHUTZ: Auf der Systempartition sind nur noch %d MB frei. Lege Dateien auf /data ab.' % free
     return None
 
+def norm_cmd(cmd):
+    """Unscheinbare Unterschiede zwischen zwei Versuchen desselben Befehls ignorieren."""
+    c = re.sub(r'\b[12]>\s*/dev/null\b', ' ', cmd)
+    c = re.sub(r'\b[12]>&\d+\b', ' ', c)
+    c = re.sub(r'\|\s*(head|tail)(\s+-\S+)*', ' ', c)
+    return re.sub(r'\s+', ' ', c).strip()
+
+
+def classify(tool, inp):
+    """Aktionsklasse für die Freigabe – stabil, auch wenn Jarvis den Befehl umformuliert."""
+    cmd = inp.get('command', '') or ''
+    path = inp.get('file_path', '') or inp.get('notebook_path', '') or ''
+    if tool == 'Bash':
+        if GIT_PUBLISH.search(cmd):
+            return 'git-publish'
+        if re.search(r'\b(wacli|tg|gog|himalaya)\b[^;&|]*\b(send|reply|forward|fwd|file)\b', cmd, re.I):
+            m = re.search(r'(?:--to|-t|--chat|--recipient)\s+["\']?([^\s"\';|]+)', cmd)
+            return 'send:' + (m.group(1) if m else 'any')
+        if re.search(r'(curl|wget)[^|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b', cmd):
+            return 'remote-exec'
+        if CRITICAL.search(cmd):
+            return 'critical:' + norm_cmd(cmd)
+        if EXFIL.search(cmd):
+            return 'exfil'
+        if SECRETS.search(cmd):
+            return 'secret'
+        if PERSIST.search(cmd):
+            return 'persist'
+        return 'bash:' + norm_cmd(cmd)
+    if tool in ('Write', 'Edit', 'MultiEdit', 'NotebookEdit'):
+        return 'write:' + path.replace(HOME, '~')
+    if tool == 'Read':
+        return 'read:' + path.replace(HOME, '~')
+    if tool == 'WebFetch':
+        return 'web:' + (inp.get('url', '') or '')
+    return tool
+
+
 def _key(tool, inp):
-    """Was genau freigegeben wird: Befehl bzw. Pfad/URL."""
-    return '%s:%s' % (tool, inp.get('command') or inp.get('file_path') or inp.get('notebook_path') or inp.get('url') or '')
+    """Was genau freigegeben wird: Befehl bzw. Pfad/URL (Redirects/head ignorieren)."""
+    if tool == 'Bash':
+        return 'Bash:' + norm_cmd(inp.get('command', '') or '')
+    return '%s:%s' % (tool, inp.get('file_path') or inp.get('notebook_path') or inp.get('url') or '')
+
+
+def _pending(s):
+    """Pending-Einträge – alte State-Dateien mit reinen Strings werden mitgelesen."""
+    out = []
+    for e in s.get('pending', []):
+        if isinstance(e, dict):
+            out.append(e)
+            continue
+        tool, _, val = e.partition(':')
+        if tool == 'Bash':
+            out.append({'key': 'Bash:' + norm_cmd(val), 'cat': classify('Bash', {'command': val})})
+        else:
+            out.append({'key': e, 'cat': classify(tool, {'file_path': val, 'url': val})})
+    return out
 
 
 def check_pre(tool, inp, s):
@@ -207,16 +273,19 @@ def main():
     s['sid'] = sid
 
     if mode == 'taint':
-        s['tainted'] = True; s['t'] = time.time(); s['granted'] = []
+        # Neue fremde Inhalte verlängern den Taint, dürfen aber eine bereits erteilte
+        # Freigabe nicht wegwischen (sonst scheitert jeder zweite Versuch erneut).
+        s['tainted'] = True; s['t'] = time.time()
         save(s); return
 
     if mode == 'taintmsg':
-        # Nachrichten/Mails gelesen (fremde Inhalte) -> wie Webinhalte behandeln
+        # Nur echtes Lesen fremder Inhalte setzt Taint – und nur einmal pro Runde.
         ti = data.get('tool_input', {}) or {}
         cmd = ti.get('command', '') or ''
         fp = ti.get('file_path', '') or ''
-        if MSG_READ.search(cmd) or '/jarvis/research' in cmd or 'jarvis-research --show' in cmd or '/jarvis/research/' in fp:
-            s['tainted'] = True; s['t'] = time.time(); s['granted'] = []
+        if not s.get('tainted') and (MSG_READ.search(cmd) or '/jarvis/research' in cmd
+                                     or 'jarvis-research --show' in cmd or '/jarvis/research/' in fp):
+            s['tainted'] = True; s['t'] = time.time()
             save(s)
         return
 
@@ -229,7 +298,11 @@ def main():
         # sperrt zusätzlich zu NEIN, sonst würde "mach das nicht" über "mach das" fälschlich als Ja zählen.
         negated = NEIN.search(body) or re.search(r'\bnicht\b', body, re.I)
         consents = from_harry and not negated and YES.search(body)
-        s['granted'] = list(s.get('pending', [])) if consents else []
+        entries = _pending(s) if consents else []
+        s['granted'] = [e['key'] for e in entries]
+        # Zerstörer bleiben an den exakten Befehl gebunden, alles andere an die Aktionsklasse.
+        s['granted_cats'] = [e['cat'] for e in entries if not e['cat'].startswith('critical:')]
+        s['grant_t'] = time.time() if consents else 0
         s['pending'] = []
         save(s); return
 
@@ -237,14 +310,18 @@ def main():
         tool = data.get('tool_name', '')
         inp = data.get('tool_input', {}) or {}
         key = _key(tool, inp)
+        cat = classify(tool, inp)
         if key in s.get('granted', []):
             s['granted'].remove(key); save(s)
             return
+        if cat in s.get('granted_cats', []) and time.time() - s.get('grant_t', 0) <= GRANT_TTL:
+            return
         why = check_pre(tool, inp, s)
         if why:
-            s.setdefault('pending', [])
-            if key not in s['pending']:
-                s['pending'] = (s['pending'] + [key])[-5:]
+            pending = _pending(s)
+            if not any(e['key'] == key for e in pending):
+                pending = (pending + [{'key': key, 'cat': cat}])[-5:]
+            s['pending'] = pending
             save(s)
             deny(why)
         return

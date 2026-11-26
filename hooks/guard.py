@@ -80,7 +80,19 @@ GUARD_FILES = re.compile(r'(hooks/guard\.py|brain-settings\.json|\.claude/settin
 # Veröffentlichen/Hooks umgehen (immer): Jarvis pusht nie ohne Harrys Ja
 GIT_PUBLISH = re.compile(r'\bgit\b[^;&|]*\s(push|remote\s+(add|set-url))\b|--no-verify\b|\bcore\.hooksPath\b|\bgh\s+(repo|release|gist)\s+(create|edit|upload)\b')
 GUARD_WRITE = re.compile(r'(\bsed\s+(-\S+\s+)*-i|(?<![0-9&])>(?!&)|\btee\b|\bmv\b|\bcp\b|\brm\b|\bchmod\b|\btruncate\b|\bln\b|\bpatch\b|\bgit\s+(checkout|restore|apply))')
-YES = re.compile(r'^\s*(ja|jawohl|jo|yes|okay|ok|klar|genau|mach( das| es)?( bitte)?|bestätigt|einverstanden|los|tu es|führ(e)? (es|ihn|das) aus)\b', re.I)
+NEIN = re.compile(r'^\s*(nein|nee|ne|nicht|stopp?|abbrechen|lass\s+es|warte)\b', re.I)
+# Bewusst als re.search über die ganze Antwort (nicht nur Satzanfang): natürlich gesprochene Zustimmung
+# kommt selten als blankes "ja" zurück ("du darfst es abschicken", "du hast meine erlaubnis", "ist ok so").
+# Sicher genug, weil das nur direkt auf Jarvis' eigene Nachfrage ("brauch dein Ja: ...") hin ausgewertet wird.
+YES = re.compile(r'''(?x)
+    \b(ja|jawohl|jo|yes|okay|ok|klar|genau|bestätigt|einverstanden|los|passt|
+       erlaubt|genehmigt|freigegeben|in\s+ordnung)\b
+  | \bmach(e)?\s*(das|es|ruhig)?\s*(bitte)?\b
+  | \btu\s+es\b | \bführ(e)?\s+(es|ihn|das)\s+aus\b
+  | \bdu\s+(darfst|kannst)\b
+  | \b(du\s+hast\s+)?(meine\s+)?(ausdrückliche\s+)?erlaubnis\b
+  | \b(schick|sende?|führ)(e|'?s)?\s+(es\s+)?(ruhig\s+)?(so\s+)?(ab|los|aus)\b
+''', re.I)
 
 def load():
     try:
@@ -213,8 +225,11 @@ def main():
         body = text.split('\n', 1)[1] if text.startswith('[Kontext:') and '\n' in text else text
         body = body.replace('[getippt]', '').strip()
         from_harry = 'Quelle: Sprache' in text or 'Quelle: getippt' in text
-        # Ja gilt nur für das, was zuletzt blockiert wurde – nicht pauschal
-        s['granted'] = list(s.get('pending', [])) if (from_harry and YES.match(body)) else []
+        # Ja gilt nur für das, was zuletzt blockiert wurde – nicht pauschal. "nicht" an beliebiger Stelle
+        # sperrt zusätzlich zu NEIN, sonst würde "mach das nicht" über "mach das" fälschlich als Ja zählen.
+        negated = NEIN.search(body) or re.search(r'\bnicht\b', body, re.I)
+        consents = from_harry and not negated and YES.search(body)
+        s['granted'] = list(s.get('pending', [])) if consents else []
         s['pending'] = []
         save(s); return
 

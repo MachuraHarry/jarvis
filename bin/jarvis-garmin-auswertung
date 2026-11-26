@@ -1,8 +1,14 @@
 #!/bin/sh
-# Garmin-Auswertung: Uhr per Bluetooth synchronisieren (optional) und Puls/Stress des Tages auswerten.
+# Garmin-Auswertung: Uhr per Bluetooth synchronisieren (optional) und Puls/Stress/Schlaf/Route auswerten.
 #   jarvis-garmin-auswertung            nur auswerten (neueste lokale FIT-Dateien)
 #   jarvis-garmin-auswertung --sync     vorher Uhr per BLE synchronisieren (Live-Daemon kurz aus)
+#   jarvis-garmin-auswertung --route    GPS-Route der letzten aufgezeichneten Aktivität zusammenfassen
 #   jarvis-garmin-auswertung --cloud    zusätzlich Connect-Cloud-Tageszusammenfassung (nur wenn über Handy synchronisiert)
+# Nutzt garmin-proto-lab (.venv-lab) statt der generischen fitparse-Bibliothek, weil fitparse Garmins
+# eigene Wellness-Nachrichtentypen (Schlafphasen, SpO2, Body Battery …) nicht kennt (Stand 2026-11-26:
+# sleep_level wird von garmin-proto-lab korrekt decodiert, SpO2/Body Battery liefert diese Uhr weder
+# live noch in FIT-Dateien – vermutlich Firmware-/Hardware-Grenze der fenix 5 Plus, mit echten Daten
+# geprüft, nicht angenommen).
 G="$HOME/jarvis/garmin"
 if [ "$1" = "--sync" ] || [ "$2" = "--sync" ]; then
   jarvis-watch stop >/dev/null
@@ -10,24 +16,67 @@ if [ "$1" = "--sync" ] || [ "$2" = "--sync" ]; then
   jarvis-watch start >/dev/null
 fi
 mkdir -p "$HOME/jarvis/state"
-"$G/.venv/bin/python" -I - "$G/data/fit" <<'PY'
-import sys, glob, statistics
-from fitparse import FitFile
+
+if [ "$1" = "--route" ] || [ "$2" = "--route" ]; then
+  "$G/.venv-lab/bin/python" - "$G/data/fit" <<'PY'
+import sys, glob
+from garmin_proto_lab.fit import extract_activity_samples, activity_sample_dict
 d = sys.argv[1]
-hr, st = [], []
-for f in sorted(glob.glob(d + "/*monitoring_b*.fit")):
-    for m in FitFile(f).get_messages():
-        v = {x.name: x.value for x in m}
-        if m.name == "monitoring" and v.get("heart_rate"):
-            hr.append(v["heart_rate"])
-        if m.name == "stress_level" and v.get("stress_level_value") is not None and v["stress_level_value"] >= 0:
-            st.append(v["stress_level_value"])
+files = sorted(glob.glob(d + "/*activity*.fit"), reverse=True)
+if not files:
+    print("Keine aufgezeichnete Aktivität (GPS-Lauf/Fahrt/Wanderung) lokal vorhanden.")
+    print("Auf der Uhr eine Aktivität mit GPS starten+beenden, dann: jarvis-garmin-auswertung --sync --route")
+    raise SystemExit(0)
+f = files[0]
+pts = [activity_sample_dict(s) for s in extract_activity_samples(open(f, "rb").read())]
+geo = [p for p in pts if p["latitude_deg"] is not None and p["longitude_deg"] is not None]
+print(f"Datei: {f.split('/')[-1]}  ({len(pts)} Messpunkte, {len(geo)} mit GPS-Position)")
+if not geo:
+    print("Keine GPS-Positionsdaten in dieser Aktivität (Innenraum-/Hallentraining ohne GPS?).")
+    raise SystemExit(0)
+lats = [p["latitude_deg"] for p in geo]; lons = [p["longitude_deg"] for p in geo]
+dists = [p["distance_m"] for p in geo if p["distance_m"] is not None]
+hrs = [p["heart_rate_bpm"] for p in geo if p["heart_rate_bpm"] is not None]
+print(f"Start: {geo[0]['timestamp_utc']}  Ende: {geo[-1]['timestamp_utc']}")
+print(f"Start-Position: {lats[0]:.5f}, {lons[0]:.5f}  Ende-Position: {lats[-1]:.5f}, {lons[-1]:.5f}")
+print(f"Begrenzungsrahmen: lat {min(lats):.5f}..{max(lats):.5f}  lon {min(lons):.5f}..{max(lons):.5f}")
+if dists:
+    print(f"Distanz: {max(dists)/1000:.2f} km")
+if hrs:
+    print(f"Puls: Mittel {round(sum(hrs)/len(hrs))}, min {min(hrs)}, max {max(hrs)}")
+print(f"Karte (Startpunkt): https://www.openstreetmap.org/?mlat={lats[0]:.5f}&mlon={lons[0]:.5f}#map=15/{lats[0]:.5f}/{lons[0]:.5f}")
+PY
+  exit 0
+fi
+
+"$G/.venv-lab/bin/python" - "$G/data/fit" <<'PY'
+import sys, glob, statistics
+from garmin_proto_lab.fit import extract_wellness_samples, wellness_sample_dict
+d = sys.argv[1]
+hr, st, sleep_mins = [], [], {}
+for f in sorted(glob.glob(d + "/*monitoring_b*.fit")) + sorted(glob.glob(d + "/*sleep*.fit")):
+    for s in extract_wellness_samples(open(f, "rb").read()):
+        v = wellness_sample_dict(s)
+        k, vals = v["kind"], v["values"]
+        if k == "monitoring" and vals.get("heart_rate_bpm"):
+            hr.append(vals["heart_rate_bpm"])
+        if k == "stress" and vals.get("stress_level") is not None and vals["stress_level"] >= 0:
+            st.append(vals["stress_level"])
+        if k == "sleep_level" and vals.get("sleep_level"):
+            lvl = vals["sleep_level"]
+            sleep_mins[lvl] = sleep_mins.get(lvl, 0) + 1  # 1 Eintrag ~ 1 Minute laut sample_length
+
 def line(name, xs):
     if not xs: return f"{name}: keine Daten"
     return f"{name}: {len(xs)} Messungen, Mittel {round(statistics.mean(xs))}, min {min(xs)}, max {max(xs)}"
 print(line("Puls (bpm)", hr))
 print(line("Stress", st))
-print("Schlaf: FIT-Nachrichten nicht decodiert (Protokoll unbekannt), Cloud-Werte siehe --cloud")
+if sleep_mins:
+    gesamt = sum(sleep_mins.values())
+    teile = ", ".join(f"{k} {v} min" for k, v in sorted(sleep_mins.items(), key=lambda x: -x[1]))
+    print(f"Schlaf/Ruhe-Phasen ({gesamt} min erfasst): {teile}")
+else:
+    print("Schlaf: keine sleep_level-Daten in den lokalen FIT-Dateien (ggf. --sync, oder Uhr nachts nicht getragen).")
 PY
 if [ "$1" = "--cloud" ] || [ "$2" = "--cloud" ] || [ "$3" = "--cloud" ]; then
   timeout 90 "$HOME/jarvis/bin/jarvis-garmin" summary 2>&1 | head -20

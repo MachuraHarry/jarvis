@@ -71,7 +71,10 @@ claude = shutil.which('claude') or os.path.expanduser('~/.local/bin/claude')
 rc, out = sh([claude, '--version'], 20)
 add('OK' if rc == 0 else 'FEHLER', 'claude CLI', out.splitlines()[0] if out else 'nicht gefunden')
 if h.get('backend') == 'opencode':
-    rc, out = sh(['opencode', '--version'], 20)
+    oc = '/data/home/opt/bin/opencode'
+    if not os.path.exists(oc):
+        oc = shutil.which('opencode') or 'opencode'
+    rc, out = sh([oc, '--version'], 20)
     add('OK' if rc == 0 else 'FEHLER', 'OpenCode CLI', out.splitlines()[0] if out else 'nicht gefunden')
 try:
     tail = open(os.path.join(J, 'brain.log'), errors='replace').read().splitlines()[-30:]

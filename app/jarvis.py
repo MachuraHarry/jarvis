@@ -738,7 +738,10 @@ class OpenCodeBrain(Brain):
         full, open_tools = [], set()
         acted, quota, last_error = False, False, None
 
-        opencode = shutil.which('opencode')
+        env = brain_env()
+        # Nicht die PATH des Startprozesses nutzen: dort liegt oft eine alte opencode-Version
+        # (~/.opencode/bin), die z. B. keine Projekt-Agenten findet.
+        opencode = shutil.which('opencode', path=env['PATH'])
         if not opencode:
             return ('fallback', None, 'opencode nicht im PATH')
         cmd = [opencode, 'run', '--format', 'json', '--auto', '--session', self.session_id,
@@ -751,7 +754,7 @@ class OpenCodeBrain(Brain):
         errf.write('\n=== %s OpenCode start (%s) ===\n' % (time.strftime('%F %T'), self.model)); errf.flush()
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errf,
-                                 text=True, bufsize=1, cwd=self.wd, env=brain_env())
+                                 text=True, bufsize=1, cwd=self.wd, env=env)
         except Exception as e:
             errf.close()
             log('brain: OpenCode start fehlgeschlagen', e)

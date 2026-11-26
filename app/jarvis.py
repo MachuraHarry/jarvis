@@ -668,14 +668,19 @@ class OpenCodeBrain(Brain):
         self.owner = None
         self._alive = False
         self._proc = None
+        self.wd = os.path.join(JDIR, 'workspace')
+        self.agent = os.path.join(self.wd, '.opencode', 'agents', 'jarvis.md')
+        self._ensure_agent()
+
+    def _ensure_agent(self):
+        """Persona als OpenCode-Agent ablegen – beim Umschalten, nicht erst bei der Frage."""
+        os.makedirs(os.path.dirname(self.agent), exist_ok=True)
+        with open(self.agent, 'w') as f:
+            f.write(bb.agent_file_text(self._persona()))
+        os.chmod(self.agent, 0o600)
 
     def _spawn(self):
-        wd = os.path.join(JDIR, 'workspace')
-        os.makedirs(os.path.join(wd, '.opencode', 'agents'), exist_ok=True)
-        agent = os.path.join(wd, '.opencode', 'agents', 'jarvis.md')
-        with open(agent, 'w') as f:
-            f.write(bb.agent_file_text(self._persona()))
-        os.chmod(agent, 0o600)
+        self._ensure_agent()
         # OpenCode verlangt Session-IDs mit Präfix `ses`
         self.session_id = 'ses_jarvis%d' % int(time.time())
         self.started = time.time()
@@ -705,19 +710,20 @@ class OpenCodeBrain(Brain):
         if status != 'fallback':
             on_done(full, err)
             return
-        log('brain: OpenCode-Kontingent erschöpft – Claude übernimmt diese Runde')
+        reason = err or 'OpenCode nicht verfügbar'
+        log('brain: OpenCode nicht nutzbar (%s) – Claude übernimmt diese Runde' % reason)
         CFG['backend'], CFG['model'] = bb.normalize('claude', 'haiku')
         save_config(CFG)
         ui.send('model', backend=CFG['backend'], model=CFG['model'], label=bb.label(CFG['backend'], CFG['model']))
         ui.send('toast', level='warn', icon='info',
-                text='OpenCode-Kontingent aufgebraucht – Claude übernimmt')
+                text='OpenCode nicht verfügbar (%s) – Claude übernimmt' % reason[:80])
         if self.owner:
             self.owner.brain = Brain()
             self.owner.brain.owner = self.owner
             self.owner.brain.started = time.time()
             self.owner.brain.ask(text, on_delta, on_tool, on_done, on_result)
         else:
-            on_done(full, 'OpenCode-Kontingent aufgebraucht und kein Fallback verfügbar.')
+            on_done(full, 'OpenCode nicht verfügbar (%s) und kein Fallback da.' % (err or 'unbekannt'))
 
     def _ask_once(self, text, on_delta, on_tool, on_result):
         """-> ('done'|'fallback', full|None, err|None)"""
@@ -730,7 +736,7 @@ class OpenCodeBrain(Brain):
         self.last_used = time.time()
         gen = self.cancel_gen
         full, open_tools = [], set()
-        acted, quota = False, False
+        acted, quota, last_error = False, False, None
 
         opencode = shutil.which('opencode')
         if not opencode:
@@ -745,7 +751,7 @@ class OpenCodeBrain(Brain):
         errf.write('\n=== %s OpenCode start (%s) ===\n' % (time.strftime('%F %T'), self.model)); errf.flush()
         try:
             p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=errf,
-                                 text=True, bufsize=1, cwd=os.path.join(JDIR, 'workspace'), env=brain_env())
+                                 text=True, bufsize=1, cwd=self.wd, env=brain_env())
         except Exception as e:
             errf.close()
             log('brain: OpenCode start fehlgeschlagen', e)
@@ -781,8 +787,8 @@ class OpenCodeBrain(Brain):
                 if quota or bb.quota_error(''.join(full) + self.stderr_tail()):
                     return ('fallback', None, None)
                 if not acted and gen == self.cancel_gen:
-                    return ('fallback', None, None)
-                return ('done', ''.join(full) if gen == self.cancel_gen else None, None)
+                    return ('done', None, last_error or 'OpenCode hat ohne Antwort beendet (siehe brain.log).')
+                return ('done', ''.join(full) if gen == self.cancel_gen else None, last_error)
             info = bb.parse_event(e)
             kind = info.get('kind')
             if kind == 'delta':
@@ -800,6 +806,7 @@ class OpenCodeBrain(Brain):
                     open_tools.discard(tid)
             elif kind == 'error':
                 text_err = info['text']
+                last_error = text_err[:300]
                 log('brain: OpenCode-Fehler', text_err[:200])
                 if bb.quota_error(text_err):
                     quota = True

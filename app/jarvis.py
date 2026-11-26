@@ -711,12 +711,13 @@ class OpenCodeBrain(Brain):
             on_done(full, err)
             return
         reason = err or 'OpenCode nicht verfügbar'
-        log('brain: OpenCode nicht nutzbar (%s) – Claude übernimmt diese Runde' % reason)
+        quota = status == 'quota'
+        headline = 'Kontingent aufgebraucht' if quota else 'OpenCode nicht verfügbar (%s)' % reason[:60]
+        log('brain: %s – Claude übernimmt diese Runde' % headline)
         CFG['backend'], CFG['model'] = bb.normalize('claude', 'haiku')
         save_config(CFG)
         ui.send('model', backend=CFG['backend'], model=CFG['model'], label=bb.label(CFG['backend'], CFG['model']))
-        ui.send('toast', level='warn', icon='info',
-                text='OpenCode nicht verfügbar (%s) – Claude übernimmt' % reason[:80])
+        ui.send('toast', level='warn', icon='info', text=headline + ' – Claude übernimmt')
         if self.owner:
             self.owner.brain = Brain()
             self.owner.brain.owner = self.owner
@@ -726,7 +727,7 @@ class OpenCodeBrain(Brain):
             on_done(full, 'OpenCode nicht verfügbar (%s) und kein Fallback da.' % (err or 'unbekannt'))
 
     def _ask_once(self, text, on_delta, on_tool, on_result):
-        """-> ('done'|'fallback', full|None, err|None)"""
+        """-> ('done'|'fallback'|'quota', full|None, err|None)"""
         if self.turns >= CFG['max_turns_per_brain']:
             log('brain: frischer Kontext nach %d Runden' % self.turns)
             self.restart()
@@ -790,7 +791,7 @@ class OpenCodeBrain(Brain):
                 self._proc = None
                 errf.close()
                 if quota or bb.quota_error(''.join(full) + self.stderr_tail()):
-                    return ('fallback', None, None)
+                    return ('quota', None, 'Kontingent aufgebraucht')
                 if not acted and gen == self.cancel_gen:
                     return ('done', None, last_error or 'OpenCode hat ohne Antwort beendet (siehe brain.log).')
                 return ('done', ''.join(full) if gen == self.cancel_gen else None, last_error)
@@ -815,7 +816,7 @@ class OpenCodeBrain(Brain):
                 log('brain: OpenCode-Fehler', text_err[:200])
                 if bb.quota_error(text_err):
                     quota = True
-                    return ('fallback', None, None)
+                    return ('quota', None, 'Kontingent aufgebraucht')
 
 
 def make_brain():

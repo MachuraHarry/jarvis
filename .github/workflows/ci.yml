@@ -6,8 +6,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Syntax
@@ -17,14 +17,13 @@ jobs:
       - name: Selbsttest (Wächter, Sprache, Chronik, lokale Befehle)
         run: python tests/selftest.py
       - name: Shell-Skripte
-        continue-on-error: true
         run: |
           sudo apt-get install -y shellcheck >/dev/null
           shellcheck -S error run.sh tools/fetch-models.sh $(grep -l '^#!/bin/sh' bin/*)
   secrets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2

@@ -5,7 +5,9 @@ B=$(ls -d /sys/class/backlight/* | head -1); MAX=$(cat $B/max_brightness); CUR=$
 P=$((CUR*100/MAX))
 case "$1" in
   "") ;;
-  +*|-*) P=$((P $(echo $1|cut -c1) $(echo $1|cut -c2-)));;
+  +[0-9]*) P=$((P + ${1#+}));;
+  -[0-9]*) P=$((P - ${1#-}));;
+  *[!0-9]*) echo "Aufruf: jarvis-brightness [70|+10|-10]" >&2; exit 2;;
   *) P=$1;;
 esac
 [ $P -lt 3 ] && P=3; [ $P -gt 100 ] && P=100

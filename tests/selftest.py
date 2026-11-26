@@ -103,6 +103,17 @@ with tempfile.TemporaryDirectory() as d:
     run('prompt', {'session_id': 'm', 'prompt': '[Kontext: Quelle: Sprache]\ndu darfst es so abschicken'})
     run('taintmsg', {'session_id': 'm', 'tool_input': {'command': 'wacli chats list --query Jan'}})
     check('guard.e2e.send.variant', run('pre', snd2) == '')
+
+    # Vorab-Ja: erst fragen, dann Harry zustimmen lassen, dann erst blockieren
+    pre = {'session_id': 'p', 'tool_name': 'Bash',
+           'tool_input': {'command': 'cd /home/harry/jarvis && git push origin main 2>&1; echo "exit=$?"; git status -sb | head -1'}}
+    run('prompt', {'session_id': 'p', 'prompt': '[Kontext: Quelle: Sprache]\nja bitte'})
+    check('guard.e2e.preconsent', run('pre', pre) == '')
+    run('prompt', {'session_id': 'p', 'prompt': '[Kontext: Quelle: Sprache]\nwas machst du gerade'})
+    check('guard.e2e.preconsent.cleared', 'deny' in run('pre', pre))
+    run('prompt', {'session_id': 'p', 'prompt': '[Kontext: Quelle: Sprache]\nja bitte'})
+    check('guard.e2e.preconsent.critical',
+          'deny' in run('pre', {'session_id': 'p', 'tool_name': 'Bash', 'tool_input': {'command': 'rm -rf /'}}))
     sys.stdin = sys.__stdin__
 
 # ── Sprache: Weckwort, Text säubern/teilen ──

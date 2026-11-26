@@ -8,6 +8,8 @@ Dann werden nur Nachrichtenversand und curl|sh blockiert, bis Harry in seiner N�
 Unabhängig davon werden echte Zerstörer (rm -rf /, rm *, mkfs, dd auf Geräte …) IMMER gestoppt.
 Die Zustimmung gilt nur für diese eine Runde, aber für die ganze Aktionsklasse: Jarvis darf den
 Befehl danach leicht umformulieren (z.B. `| head -1` statt `| head -2`), ohne erneut fragen zu müssen.
+Auch eine Zustimmung VOR der ersten Sperre zählt: sagt Harry „ja bitte“ auf „Soll ich pushen?“,
+darf die danach blockierte Aktion in derselben Runde durch. Zerstörer bleiben immer separat.
 
 Zusätzlich (immer aktiv): SPEICHERSCHUTZ für die kleine Systempartition (/, ~2,6 GB).
 Nur apk-Installationen, die den freien Platz unter die Reserve drücken würden, werden blockiert.
@@ -17,6 +19,8 @@ Härtung:
 - FREIGABE GEBUNDEN: Harrys Ja gibt die zuletzt blockierten Aktionen frei – pro Aktionsklasse
   (git push, Senden an denselben Empfänger, Upload, Pfad), einmalig pro Runde. Bei Zerstörern bleibt
   die Freigabe bewusst an den exakten Befehl gebunden.
+- VORAB-JA: Kam das Ja vor der ersten Sperre, gilt es für die nächste blockierte Aktion derselben
+  Runde (außer Zerstörern) – Jarvis fragt ja oft zuerst und führt die Aktion erst danach aus.
 - TAINT zusätzlich: Datenabfluss (curl -d/-F/-T, nc, scp, rsync/ssh nach außen, lange Query-URLs per WebFetch),
   Zugriff auf Zugangsdaten (~/.ssh, Tokens, Credentials) und Persistenz (Shell-Profile, Autostart, cron, /etc).
 - WÄCHTER-SCHUTZ (immer): Änderungen an guard.py, brain-settings.json, Git-Hooks, system/ brauchen Harrys Ja.
@@ -303,6 +307,9 @@ def main():
         # Zerstörer bleiben an den exakten Befehl gebunden, alles andere an die Aktionsklasse.
         s['granted_cats'] = [e['cat'] for e in entries if not e['cat'].startswith('critical:')]
         s['grant_t'] = time.time() if consents else 0
+        # Jarvis fragt häufig erst „Soll ich …?“ und führt die Aktion erst nach dem Ja aus.
+        # Dann gibt es noch kein pending – das Ja trotzdem für diese Runde merken.
+        s['preconsent'] = time.time() if consents else 0
         s['pending'] = []
         save(s); return
 
@@ -317,6 +324,8 @@ def main():
         if cat in s.get('granted_cats', []) and time.time() - s.get('grant_t', 0) <= GRANT_TTL:
             return
         why = check_pre(tool, inp, s)
+        if why and not CRITICAL.search(inp.get('command', '') or '') and time.time() - s.get('preconsent', 0) <= GRANT_TTL:
+            return                      # Harrys Ja kam vor der Sperre – in dieser Runde gilt es
         if why:
             pending = _pending(s)
             if not any(e['key'] == key for e in pending):

@@ -739,6 +739,8 @@ class OpenCodeBrain(Brain):
         acted, quota, last_error = False, False, None
 
         env = brain_env()
+        # OpenCode findet Projekt-Agenten über $PWD, nicht über cwd – beides muss stimmen.
+        env['PWD'] = self.wd
         # Nicht die PATH des Startprozesses nutzen: dort liegt oft eine alte opencode-Version
         # (~/.opencode/bin), die z. B. keine Projekt-Agenten findet.
         opencode = shutil.which('opencode', path=env['PATH'])

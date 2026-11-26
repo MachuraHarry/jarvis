@@ -29,7 +29,9 @@ function tick() {
   const d = new Date();
   const hm = pad(d.getHours()) + ':' + pad(d.getMinutes()), c = $('#clock').firstChild;
   if (c.nodeValue !== hm) c.nodeValue = hm;
-  setTxt($('#secs'), pad(d.getSeconds()));
+  // PERF-TEST (Harry, 2026-11-26): Sekundenanzeige deaktiviert, um zu prüfen ob das
+  // Ein-Hz-Repaint der WebKitWebProcess-Dauerlast im Leerlauf verursacht. Bei Erfolg
+  // dauerhaft entfernen, sonst zurücksetzen auf: setTxt($('#secs'), pad(d.getSeconds()));
   setTxt($('#date'), `${WD[d.getDay()]}, ${d.getDate()}. ${MO[d.getMonth()]} ${d.getFullYear()}`);
 }
 function startClock() { clearInterval(clockTimer); tick(); clockTimer = setInterval(tick, 1000); }
